@@ -12,6 +12,6 @@ pkgbase = gz302-camera-firmware
 	options = !debug
 	options = !strip
 	source = gz302-camera-firmware-0.2.0.tar.gz::https://github.com/Terminus-star/asus-gz302-ov13b10-isp4/archive/refs/tags/v0.2.0.tar.gz
-	b2sums = SKIP
+	b2sums = 3ee0cc3e5ad7b9eb81b0f251fbbc7e56bb909b38f98ca6f5872626b7f60f3619bdf14459d726ad7166d78bdc794970d18791ae511e8c51b453e788cd8a6b31f3
 
 pkgname = gz302-camera-firmware
