@@ -1,0 +1,98 @@
+From: GZ302 camera enablement <local>
+Subject: [PATCH] media: ov13b10: add GZ302 DMI quirk for PLL and mode registers
+
+On the ASUS ROG Flow Z13 (GZ302) the sensor is clocked differently from the
+boards the driver was written for, and the 4208x3120 mode needs the register
+values the Windows driver writes (PLL 0x0303/0x0305/0x0325, Bayer phase
+0x3813=0x08 and a few timing registers); without them the image is magenta or
+the ISP sees corrupt packets. Apply them after the controls are set up and
+before stream-on, only when DMI says GZ302 (module parameter gz302_fixups:
+-1 auto, 0 off, 1 force).
+---
+diff --git a/drivers/media/i2c/ov13b10.c b/drivers/media/i2c/ov13b10.c
+--- a/drivers/media/i2c/ov13b10.c
++++ b/drivers/media/i2c/ov13b10.c
+@@ -4,6 +4,7 @@
+ #include <linux/acpi.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
++#include <linux/dmi.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+@@ -838,6 +839,56 @@
+ 	return ov13b10_write_regs(ov13b, r_list->regs, r_list->num_of_regs);
+ }
+ 
++/*
++ * GZ302 quirk (ASUS ROG Flow Z13 GZ302, rear camera behind the AMD ISP4).
++ *
++ * On this board the sensor clock is 24 MHz (the board data claims 19.2 MHz) and the AMD ISP firmware
++ * expects the readout window of the Windows driver's mode table.  These values are written after the
++ * normal PLL list, mode table and controls, while the sensor is still in standby, for the 4208x3120
++ * mode only (asus-gz302-ov13b10-isp4 docs/bringup-summary.md, items 6 and 7):
++ *   - PLL for 1120 Mbps/lane from 24 MHz: 0x0303=0x01, 0x0305=0x46, 0x0325=0x55
++ *   - 0x3813=0x08: vertical window offset; the generic 0x09 shifts the Bayer pattern by one row
++ *     and gives a strong magenta cast on the AMD ISP
++ *   - 0x3600, 0x380f (frame length 0x0c94 = 3220 lines) and the Windows-only 0x3011, 0x3774,
++ *     0x3823, 0x3827; which of these matter beyond 0x3813 is not isolated yet
++ * gz302_fixups: -1 = auto (DMI match, default), 0 = never, 1 = always.  Writable at run time, so it can
++ * be switched between streaming sessions for experiments.
++ */
++static int gz302_fixups = -1;
++module_param(gz302_fixups, int, 0644);
++MODULE_PARM_DESC(gz302_fixups,
++		 "GZ302 (AMD ISP) register fix-ups: -1 auto via DMI (default), 0 off, 1 force");
++
++static const struct dmi_system_id ov13b10_gz302_dmi[] = {
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
++			DMI_MATCH(DMI_BOARD_NAME, "GZ302"),
++		},
++	},
++	{ }
++};
++
++static const struct ov13b10_reg ov13b10_gz302_regs[] = {
++	{0x0303, 0x01},		/* PLL pre-divider for 24 MHz */
++	{0x0305, 0x46},		/* PLL multiplier for 24 MHz */
++	{0x0325, 0x55},		/* PLL2 for 24 MHz */
++	{0x3813, 0x08},		/* vertical window offset (Bayer phase) */
++	{0x3600, 0x1a},
++	{0x380f, 0x94},		/* frame length low byte */
++	{0x3011, 0x7c},
++	{0x3774, 0x2d},
++	{0x3823, 0x18},
++	{0x3827, 0x01},
++};
++
++static bool ov13b10_gz302_active(void)
++{
++	if (gz302_fixups >= 0)
++		return gz302_fixups;
++	return dmi_check_system(ov13b10_gz302_dmi);
++}
++
+ /* Open sub-device */
+ static int ov13b10_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+ {
+@@ -1274,6 +1325,18 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* GZ302 quirk: after the controls (they set the frame length), before stream on */
++	if (ov13b->cur_mode->width == 4208 && ov13b10_gz302_active()) {
++		ret = ov13b10_write_regs(ov13b, ov13b10_gz302_regs,
++					 ARRAY_SIZE(ov13b10_gz302_regs));
++		if (ret) {
++			dev_err(ov13b->dev, "%s failed to set GZ302 registers\n",
++				__func__);
++			return ret;
++		}
++		dev_info(ov13b->dev, "applied GZ302 register fix-ups (24 MHz PLL, 0x3813=0x08, ...)\n");
++	}
++
+ 	return ov13b10_write_reg(ov13b, OV13B10_REG_MODE_SELECT,
+ 				 OV13B10_REG_VALUE_08BIT,
+ 				 OV13B10_MODE_STREAMING);

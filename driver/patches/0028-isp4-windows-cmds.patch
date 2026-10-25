@@ -1,0 +1,112 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -82,6 +82,52 @@
+ MODULE_PARM_DESC(sensor_pll,
+ 		 "EXPERIMENT: after ov13b10 s_stream: 1 log the PLL registers, 2 also apply the Windows (24 MHz) PLL values");
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0028): firmware commands that the Windows driver sends for a working preview and the
++ * Linux driver never sends (Windows ETW trace, findings section 71; payloads read from amdcamera.sys, findings 72).
++ * win_cmds is a bit mask, 0 (default) = behave as before:
++ *   0x01 ENABLE_RTA                      {1}                      right after the memory pool
++ *   0x02 APPLY_TUNING_SCENARIO           {0 = SCENARIO_MODE_PREVIEW}  after SET_STREAM_CONFIG
++ *   0x04 SET_OUT_CHAN_FRAME_RATE_RATIO   {channel 0 = preview, ratio 1}  after SET_OUT_CHAN_PROP
++ *   0x08 SET_SCENE_MODE                  {0 = SCENE_MODE_DEFAULT}     after ENABLE_OUT_CHAN
++ *   0x10 SET_FPS_RANGE                   {15000, 30000}           after the META buffers, before the preview buffers
++ *   0x20 SET_ITIME_RANGE                 {40, 66666} (us)         right after SET_FPS_RANGE
++ * Not included (payload unknown or does not fit the 48-byte command slot): SET_3A_CONFIG (92 bytes, sent
++ * "indirect" by Windows), ENABLE_PREFETCH, power/clock gating (global commands), SET_M2M_CAL_DATA, SET_ADAPTIVE_RTA.
++ */
++#define EXP_CMD_ID_ENABLE_RTA			0x02090008
++#define EXP_CMD_ID_APPLY_TUNING_SCENARIO	0x02050009
++#define EXP_CMD_ID_SET_OUT_CHAN_FRAME_RATE_RATIO 0x02010004
++#define EXP_CMD_ID_SET_SCENE_MODE		0x02020007
++#define EXP_CMD_ID_SET_FPS_RANGE		0x02020008
++#define EXP_CMD_ID_SET_ITIME_RANGE		0x02020009
++
++#define EXP_WIN_RTA		0x01
++#define EXP_WIN_TUNING_SCENARIO	0x02
++#define EXP_WIN_RATE_RATIO	0x04
++#define EXP_WIN_SCENE_MODE	0x08
++#define EXP_WIN_FPS_RANGE	0x10
++#define EXP_WIN_ITIME_RANGE	0x20
++
++static unsigned int win_cmds;
++module_param(win_cmds, uint, 0444);
++MODULE_PARM_DESC(win_cmds,
++		 "EXPERIMENT: bit mask of extra Windows firmware commands: 1 RTA, 2 tuning scenario, 4 out-chan rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime range (0 = none)");
++
++/* Send one of the Windows-only commands if its bit is set; never fails the bring-up, only logs the result. */
++static void isp4sd_exp_win_cmd(struct isp4_subdev *isp_subdev, unsigned int bit, u32 cmd_id,
++			       const char *name, const u32 *words, u32 count)
++{
++	int ret;
++
++	if (!(win_cmds & bit))
++		return;
++
++	ret = isp4if_send_command(&isp_subdev->ispif, cmd_id, words, count * sizeof(u32));
++	dev_info(isp_subdev->dev, "EXP-WINCMD: %s (0x%08x) %u payload words %*ph -> ret %d\n",
++		 name, cmd_id, count, (int)(count * sizeof(u32)), words, ret);
++}
++
+ static struct device *exp_sensor_dev;		/* reference held while the sensor streams */
+ static struct v4l2_subdev *exp_sensor_sd;
+ 
+@@ -584,6 +630,12 @@
+ 		return -EINVAL;
+ 	}
+ 
++	/* EXPERIMENT (patch 0028): Windows sends the fps and integration time ranges after the META buffers */
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_FPS_RANGE, EXP_CMD_ID_SET_FPS_RANGE,
++			   "SET_FPS_RANGE", (const u32 []){ 15000, 30000 }, 2);
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_ITIME_RANGE, EXP_CMD_ID_SET_ITIME_RANGE,
++			   "SET_ITIME_RANGE", (const u32 []){ 40, 66666 }, 2);
++
+ 	sensor_info->status = ISP4SD_START_STATUS_OFF;
+ 
+ 	if (!sensor_info->start_stream_cmd_sent &&
+@@ -666,6 +718,10 @@
+ 		return ret;
+ 	}
+ 
++	/* EXPERIMENT (patch 0028): Windows sends the frame rate ratio {channel, 1} between PROP and ENABLE */
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_RATE_RATIO, EXP_CMD_ID_SET_OUT_CHAN_FRAME_RATE_RATIO,
++			   "SET_OUT_CHAN_FRAME_RATE_RATIO", (const u32 []){ cmd_ch_prop.ch, 1 }, 2);
++
+ 	/*
+ 	 * The struct will be shared with ISP FW, use memset() to guarantee
+ 	 * padding bits are zeroed, since this is not guaranteed on all
+@@ -685,6 +741,10 @@
+ 	dev_dbg(dev, "enable channel %s\n",
+ 		isp4dbg_get_out_ch_str(cmd_ch_en.ch));
+ 
++	/* EXPERIMENT (patch 0028): Windows sets the AE scene mode (0 = DEFAULT) right after ENABLE_OUT_CHAN */
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_SCENE_MODE, EXP_CMD_ID_SET_SCENE_MODE,
++			   "SET_SCENE_MODE", (const u32 []){ 0 }, 1);
++
+ 	if (!sensor_info->start_stream_cmd_sent) {
+ 		ret = isp4sd_kickoff_stream(isp_subdev,
+ 					    cmd_ch_prop.image_prop.width,
+@@ -726,6 +786,10 @@
+ 		return ret;
+ 	}
+ 
++	/* EXPERIMENT (patch 0028): Windows sends ENABLE_RTA right after the memory pool */
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_RTA, EXP_CMD_ID_ENABLE_RTA, "ENABLE_RTA",
++			   (const u32 []){ 1 }, 1);
++
+ 	/* EXPERIMENT (GZ302): Windows sends the sensor setup here, before the stream config */
+ 	isp4if_replay_sensor_setup(&isp_subdev->ispif);
+ 
+@@ -735,6 +799,10 @@
+ 		return ret;
+ 	}
+ 
++	/* EXPERIMENT (patch 0028): Windows then selects the tuning scenario (0 = preview) */
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_TUNING_SCENARIO, EXP_CMD_ID_APPLY_TUNING_SCENARIO,
++			   "APPLY_TUNING_SCENARIO", (const u32 []){ 0 }, 1);
++
+ 	return 0;
+ }
+ 

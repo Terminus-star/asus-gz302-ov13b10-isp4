@@ -1,0 +1,81 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -304,6 +304,15 @@
+ 
+ static DECLARE_DELAYED_WORK(exp_burst_work, isp4sd_exp_burst_fn);
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0034, tuning step 4): the D-PHY diagnostics of patch 0022 sleep 1.1 s inside
++ * the buffer-send path (start_streaming), during which the host cannot queue buffers and frames are
++ * dropped ("Preview buffer is not available").  phy_diag=0 skips them.  Default 1 = as before.
++ */
++static bool phy_diag = true;
++module_param(phy_diag, bool, 0444);
++MODULE_PARM_DESC(phy_diag, "EXPERIMENT: D-PHY state dumps (+100 ms, +1 s) after the sensor starts; 0 skips the 1.1 s of sleeps");
++
+ static void isp4sd_exp_sensor_start(struct device *dev, struct isp4_interface *ispif, const char *when)
+ {
+ 	struct device *sdev;
+@@ -369,7 +378,7 @@
+ 		schedule_delayed_work(&exp_burst_work, msecs_to_jiffies(sensor_burst_ms));
+ 		dev_info(dev, "EXP-SENSOR: burst limit armed: sensor standby in %u ms\n", sensor_burst_ms);
+ 	}
+-	if (!ret && isp4if_phy_init_enabled()) {
++	if (!ret && isp4if_phy_init_enabled() && phy_diag) {	/* patch 0034: phy_diag=0 skips the sleeps */
+ 		/* patch 0022: D-PHY state right after, 100 ms and 1 s after the sensor started streaming */
+ 		isp4if_phy_diag(ispif, "after s_stream");
+ 		msleep(100);
+@@ -438,6 +447,21 @@
+ static struct exp_meta_data_buf exp_meta_data[EXP_META_DATA_BUF_MAX];
+ static unsigned int exp_meta_data_cnt;
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0034, tuning step 2): the firmware takes one META_DATA buffer per frame
++ * ("LoadFrameMetaData: No meta data buffer is available" once per frame after the first 6) and the
++ * Linux driver never gives them back.  Windows re-sends a META_INFO + META_DATA pair after every
++ * frame-done (ResendMetaInFrameDone, same index for both).  The frame-done meta info does not say
++ * which META_DATA buffer was used, so they are re-sent round-robin in submission order (INFERENCE:
++ * the firmware consumes them in order, one per frame).  Needs meta_data_bufs.
++ */
++static bool meta_data_resend;
++module_param(meta_data_resend, bool, 0444);
++MODULE_PARM_DESC(meta_data_resend,
++		 "EXPERIMENT: re-send one type-13 META_DATA buffer (round-robin) after every frame-done, like Windows");
++
++static unsigned int exp_meta_data_next;	/* next META_DATA buffer to re-send */
++
+ static void isp4sd_exp_meta_data_free(void)
+ {
+ 	for (unsigned int i = 0; i < exp_meta_data_cnt; i++)
+@@ -580,6 +604,7 @@
+ 			}
+ 		}
+ 		dev_info(dev, "EXP: sent %u type-13 META_DATA buffers of 0x%x bytes\n", want, EXP_META_DATA_BUF_SIZE);
++		exp_meta_data_next = 0;		/* patch 0034: round-robin re-send starts at the first buffer */
+ 		memset(&buf_type, 0, sizeof(buf_type));
+ 	}
+ 
+@@ -1003,6 +1028,23 @@
+ 	if (isp_subdev->sensor_info.status == ISP4SD_START_STATUS_STARTED)
+ 		isp4sd_send_meta_info(isp_subdev, mc);
+ 
++	/* patch 0034: give one META_DATA buffer back per frame, like Windows' ResendMetaInFrameDone */
++	if (meta_data_resend && exp_meta_data_cnt &&
++	    isp_subdev->sensor_info.status == ISP4SD_START_STATUS_STARTED) {
++		struct exp_meta_data_buf *b = &exp_meta_data[exp_meta_data_next % exp_meta_data_cnt];
++		struct isp4fw_cmd_send_buffer md;
++
++		memset(&md, 0, sizeof(md));
++		md.buffer_type = EXP_BUFFER_TYPE_META_DATA;
++		md.buffer.vmid_space.bit.space = ISP4FW_ADDR_SPACE_TYPE_GPU_VA;
++		isp4if_split_addr64(b->gpu_addr, &md.buffer.buf_base_a_lo, &md.buffer.buf_base_a_hi);
++		md.buffer.buf_size_a = EXP_META_DATA_BUF_SIZE;
++		if (isp4if_send_command(ispif, ISP4FW_CMD_ID_SEND_BUFFER, &md, sizeof(md)))
++			dev_err(dev, "EXP: re-send of META_DATA %u failed\n",
++				exp_meta_data_next % exp_meta_data_cnt);
++		exp_meta_data_next++;
++	}
++
+ 	dev_dbg(dev, "stream_id:%d, status:%d\n", stream_id,
+ 		isp_subdev->sensor_info.status);
+ }

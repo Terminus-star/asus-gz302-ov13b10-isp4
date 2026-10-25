@@ -1,0 +1,63 @@
+# Everything still in scratch/ is local only: kernel/amdgpu trees, test results,
+# base-00NN snapshots and the Windows-derived data (firmware, disassembly, traces, ACPI dumps).
+scratch/
+
+# Kernel module build output
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.module-common.o
+Module.symvers
+modules.order
+
+# Python byte-code
+__pycache__/
+
+# Generated from Windows driver data by tools no longer in the repository; needed to build
+# driver/ but kept local
+**/isp4_ov13b_script.h
+**/isp4_ov13b_sensor_prop.h
+**/isp4_phy_seq.h
+
+# ISP firmware images built from the Windows driver's .ram files (AMD proprietary, licence for
+# redistribution unknown). Kept in firmware/ for the scripts; delete these lines only if you are
+# sure you may publish them (a private repo is still a copy on GitHub's servers).
+firmware/*.bin
+firmware/*.cpio
+firmware/stage-*/
+
+# Machine-local boot configuration copies
+limine.conf*
+
+# DKMS agent's local test folders (contain staged copies of the generated headers and build output)
+dkms/test-build-*/
+dkms/test-missing-headers/
+
+# Compiled ACPI table (iasl output; scripts/make-aur-dkms.sh compiles acpi/gz302-camb-cid.asl into the package)
+acpi/*.aml
+
+# Kernel builds (tarballs, source trees, packages; many GB). No trailing slash: kernel/build may be a
+# symlink to a folder on another disk, and git does not treat a symlink as a directory.
+kernel/build
+
+# Debug output from camera test runs (kernel logs, captured frames). The debug code itself stays in
+# the patches while the image is still being tuned; only its output is kept local.
+*.log
+*.raw
+*.yuv
+*.y4m
+
+# makepkg leftovers if a package is built inside aur/ (sources, build trees, packages)
+aur/*/src/
+aur/*/pkg/
+aur/*/*.pkg.tar.*
+aur/*/*.tar.gz
+aur/*/*.tar.gz.asc
+aur/*/PKGBUILD.before-gz302
+# Local clones of the AUR git repositories (scripts/aur-sync.sh)
+aur-git/
+
+# Personal learning notes: kept on this machine only, not published
+docs/learning-notes.md

@@ -1,0 +1,59 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -7,6 +7,7 @@
+ #include <linux/i2c.h>
+ #include <linux/moduleparam.h>
+ #include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
+ #include <linux/units.h>
+ #include <media/v4l2-subdev.h>
+ 
+@@ -45,6 +46,35 @@
+ static struct device *exp_sensor_dev;		/* reference held while the sensor streams */
+ static struct v4l2_subdev *exp_sensor_sd;
+ 
++/*
++ * The ov13b10 driver turns every I2C failure into -EIO (findings section 34).  Do the two
++ * transfers itself, directly on the adapter, and log the real return values:
++ *   - read of the 24-bit chip ID at register 0x300a (expect 56 0d 42)
++ *   - write of 0x00 to register 0x0100 (MODE_SELECT = standby: harmless)
++ * i2c_transfer() returns the number of messages done, or a negative errno (-ENXIO no
++ * acknowledge, -ETIMEDOUT bus timeout, -EAGAIN arbitration lost, -EREMOTEIO ...).
++ */
++static void isp4sd_exp_i2c_probe(struct device *dev, struct i2c_client *client, const char *when)
++{
++	u8 rd_reg[2] = { 0x30, 0x0a };
++	u8 id[3] = { 0, 0, 0 };
++	u8 wr_buf[3] = { 0x01, 0x00, 0x00 };
++	struct i2c_msg rd[2] = {
++		{ .addr = client->addr, .flags = 0, .len = sizeof(rd_reg), .buf = rd_reg },
++		{ .addr = client->addr, .flags = I2C_M_RD, .len = sizeof(id), .buf = id },
++	};
++	struct i2c_msg wr = { .addr = client->addr, .flags = 0, .len = sizeof(wr_buf), .buf = wr_buf };
++	int r_rd, r_wr;
++
++	r_rd = i2c_transfer(client->adapter, rd, 2);
++	r_wr = i2c_transfer(client->adapter, &wr, 1);
++
++	dev_info(dev,
++		 "EXP-SENSOR: raw I2C (%s) adapter %s addr 0x%02x: chip-id read ret %d (id %02x %02x %02x, want 56 0d 42), write 0x0100=0 ret %d, sensor runtime-active %d\n",
++		 when, client->adapter->name, client->addr, r_rd, id[0], id[1], id[2], r_wr,
++		 pm_runtime_active(&client->dev));
++}
++
+ static void isp4sd_exp_sensor_start(struct device *dev, const char *when)
+ {
+ 	struct device *sdev;
+@@ -70,9 +100,12 @@
+ 		return;
+ 	}
+ 
++	isp4sd_exp_i2c_probe(dev, client, "before s_stream");
++
+ 	ret = v4l2_subdev_call(sd, video, s_stream, 1);
+ 	dev_info(dev, "EXP-SENSOR: %s s_stream(1) %s START_STREAM -> %d\n", sd->name, when, ret);
+ 	if (ret) {
++		isp4sd_exp_i2c_probe(dev, client, "after failed s_stream");
+ 		put_device(sdev);
+ 		return;
+ 	}

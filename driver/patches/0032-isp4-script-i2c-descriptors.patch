@@ -1,0 +1,72 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -850,6 +850,57 @@
+ MODULE_PARM_DESC(replay_sensor_setup,
+ 		 "EXPERIMENT: send the Windows sensor setup (script + sensor properties) before SET_STREAM_CONFIG");
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0032): every device-script function fails in the firmware with
++ * "SvmSetI2c: Set i2c addr mode not 7bit nor 10bit" / "SvmRun: set I2C arg fail", even
++ * SensorConvertAGain, which has no I2C instruction: the script VM sets up its I2C target from a
++ * per-sensor descriptor before running any function, and ours is invalid (findings section 86).
++ * The SET_DEVICE_SCRIPT payload ends in four 20-byte descriptors at 0x169c + k*0x14, laid out like
++ * the firmware's own print "i2cSensor={deviceId,enRestart,deviceAddrType,regAddrType,deviceAddr}";
++ * we send them all zero.  INFERENCE: the type codes are those of get_i2c_config_OV13B in the
++ * Windows plug-in, 0x102 for the sensor at 0x10 and 0x101 for the focus motor at 0x0c, read as
++ * (deviceAddrType << 8 | regAddrType), i.e. 1 = 7-bit device address, 2 = 16-bit registers.
++ *   script_i2c=0 off (as before), 1 descriptor 0 = sensor, 2 also descriptor 1 = focus motor,
++ *   3 all four descriptors = sensor.  script_i2c_restart is written to enRestart.
++ */
++#define EXP_SCRIPT_I2C_DESC_OFF	0x169c
++#define EXP_SCRIPT_I2C_DESC_SIZE	0x14
++
++static unsigned int script_i2c;
++module_param(script_i2c, uint, 0444);
++MODULE_PARM_DESC(script_i2c,
++		 "EXPERIMENT: fill the SET_DEVICE_SCRIPT I2C descriptors: 0 off, 1 sensor, 2 sensor + focus motor, 3 all four = sensor");
++
++static unsigned int script_i2c_restart = 1;
++module_param(script_i2c_restart, uint, 0444);
++MODULE_PARM_DESC(script_i2c_restart, "EXPERIMENT: enRestart value for script_i2c (default 1)");
++
++static void isp4if_exp_put_i2c_desc(u8 *payload, unsigned int k, u32 addr, u32 code)
++{
++	u32 *d = (u32 *)(payload + EXP_SCRIPT_I2C_DESC_OFF + k * EXP_SCRIPT_I2C_DESC_SIZE);
++
++	/* d[0] = deviceId: left as built (the sensor index, 0) */
++	d[1] = script_i2c_restart;
++	d[2] = (code >> 8) & 0xff;	/* deviceAddrType */
++	d[3] = code & 0xff;		/* regAddrType */
++	d[4] = addr;			/* deviceAddr */
++}
++
++static void isp4if_exp_script_i2c(struct device *dev, u8 *payload)
++{
++	unsigned int k;
++
++	isp4if_exp_put_i2c_desc(payload, 0, 0x10, 0x102);
++	if (script_i2c == 2)
++		isp4if_exp_put_i2c_desc(payload, 1, 0x0c, 0x101);
++	if (script_i2c == 3)
++		for (k = 1; k < 4; k++)
++			isp4if_exp_put_i2c_desc(payload, k, 0x10, 0x102);
++
++	dev_info(dev, "EXP-SCRIPT-I2C: mode %u, descriptors %*ph\n", script_i2c,
++		 4 * EXP_SCRIPT_I2C_DESC_SIZE, payload + EXP_SCRIPT_I2C_DESC_OFF);
++}
++
+ static void isp4if_replay_one(struct isp4_interface *ispif, u32 cmd_id, const char *what,
+ 			      const void *data, u32 len,
+ 			      struct isp4if_gpu_mem_info **slot)
+@@ -869,6 +920,11 @@
+ 	memset(mem->sys_addr, 0, mem->mem_size);
+ 	memcpy(mem->sys_addr, data, len);
+ 
++	/* patch 0032: fill the script's I2C descriptors before the checksum is computed */
++	if (cmd_id == EXP_CMD_ID_SET_DEVICE_SCRIPT && script_i2c &&
++	    len >= EXP_SCRIPT_I2C_DESC_OFF + 4 * EXP_SCRIPT_I2C_DESC_SIZE)
++		isp4if_exp_script_i2c(dev, mem->sys_addr);
++
+ 	isp4if_split_addr64(mem->gpu_mc_addr, &pkg[0], &pkg[1]);
+ 	pkg[2] = len;
+ 	pkg[3] = isp4if_compute_check_sum(mem->sys_addr, len);

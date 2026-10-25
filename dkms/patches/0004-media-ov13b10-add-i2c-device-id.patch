@@ -1,0 +1,32 @@
+From: GZ302 camera enablement <local>
+Subject: [PATCH] media: ov13b10: add I2C device ID table
+
+The AMD ISP platform glue instantiates the sensor as an I2C client named
+"ov13b10". The driver previously supplied only ACPI IDs, so I2C core did
+not bind it to that client. Add the matching I2C ID table.
+
+---
+diff --git a/drivers/media/i2c/ov13b10.c b/drivers/media/i2c/ov13b10.c
+--- a/drivers/media/i2c/ov13b10.c
++++ b/drivers/media/i2c/ov13b10.c
+@@ -1705,6 +1705,12 @@
+ MODULE_DEVICE_TABLE(acpi, ov13b10_acpi_ids);
+ #endif
+ 
++static const struct i2c_device_id ov13b10_i2c_ids[] = {
++	{ "ov13b10" },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, ov13b10_i2c_ids);
++
+ static struct i2c_driver ov13b10_i2c_driver = {
+ 	.driver = {
+ 		.name = "ov13b10",
+@@ -1714,6 +1720,7 @@
+ 	.probe = ov13b10_probe,
+ 	.remove = ov13b10_remove,
+ 	.flags = I2C_DRV_ACPI_WAIVE_D0_PROBE,
++	.id_table = ov13b10_i2c_ids,
+ };
+ 
+ module_i2c_driver(ov13b10_i2c_driver);

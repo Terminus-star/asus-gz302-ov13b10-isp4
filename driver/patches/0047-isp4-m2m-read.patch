@@ -1,0 +1,138 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -3,11 +3,13 @@
+  * Copyright (C) 2025 Advanced Micro Devices, Inc.
+  */
+ 
++#include <linux/crc32.h>
+ #include <linux/device.h>
+ #include <linux/i2c.h>
+ #include <linux/moduleparam.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
++#include <linux/unaligned.h>
+ #include <linux/units.h>
+ #include <media/v4l2-subdev.h>
+ 
+@@ -1032,6 +1034,111 @@
+ 	return 0;
+ }
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0047): module calibration (M2M) data, step 1: read it. Windows' sensor plug-in
++ * (get_m2m_data_strix_OV13B, sensorOV13B.sys 0x1400039c0; findings 120) reads 0x1b8c bytes of the camera
++ * module's memory (I2C 0x50, 16-bit offsets; INFERENCE: an EEPROM) in three parts, each CRC-32 checked:
++ *   0x00 header (0x20 bytes, CRC at +0x1c), 0x20 header 2 (0x2c bytes, CRC at +0x48: five u16 block sizes at
++ *   +0x28/+0x2c/+0x30/+0x34/+0x38, flags at +0x22..+0x24), 0x4c the blocks (each ends in its CRC-32).
++ * It caches the result and sends it to the firmware as SET_M2M_CAL_DATA (step 2, not here). We have never
++ * sent it; the firmware logs "No valid AF calibration data" and an AWB calibration error.
++ *   m2m_read=0 off (default), 1 read once + check the CRCs (EXP-M2M lines), 2 also hex-dump it (EXP-M2M-DUMP).
++ * The read happens before START_STREAM, while the firmware does not use the I2C bus.
++ */
++#define EXP_M2M_I2C_ADDR	0x50
++#define EXP_M2M_SIZE		0x1b8c
++#define EXP_M2M_CHUNK		256
++
++static unsigned int m2m_read;
++module_param(m2m_read, uint, 0444);
++MODULE_PARM_DESC(m2m_read,
++		 "EXPERIMENT: read the camera module calibration (I2C 0x50) before the stream starts: 0 off, 1 read + CRC check, 2 also hex dump");
++
++static u8 exp_m2m_buf[EXP_M2M_SIZE];	/* cached after the first read, like Windows */
++static bool exp_m2m_done;
++
++/* one read at a 16-bit offset: write the offset (big-endian), then read len bytes */
++static int isp4sd_exp_m2m_rd(struct i2c_client *client, u16 off, u8 *buf, u16 len)
++{
++	u8 addr[2] = { off >> 8, off & 0xff };
++	struct i2c_msg msgs[2] = {
++		{ .addr = EXP_M2M_I2C_ADDR, .flags = 0, .len = sizeof(addr), .buf = addr },
++		{ .addr = EXP_M2M_I2C_ADDR, .flags = I2C_M_RD, .len = len, .buf = buf },
++	};
++	int ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++
++	return ret == ARRAY_SIZE(msgs) ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++/* Windows' checksum: standard CRC-32 (as zlib), over an even number of bytes */
++static u32 isp4sd_exp_m2m_crc(const u8 *p, u32 len)
++{
++	return ~crc32_le(~0U, p, len & ~1U);
++}
++
++static void isp4sd_exp_m2m_check(struct device *dev, const u8 *b)
++{
++	static const u8 size_off[5] = { 0x28, 0x2c, 0x30, 0x34, 0x38 };
++	u32 off = 0x4c, total = 0;
++	unsigned int i;
++
++	dev_info(dev, "EXP-M2M: header %*ph\n", 0x20, b);
++	dev_info(dev, "EXP-M2M: header CRC %08x, stored %08x; header 2 CRC %08x, stored %08x\n",
++		 isp4sd_exp_m2m_crc(b, 0x1c), get_unaligned_le32(b + 0x1c),
++		 isp4sd_exp_m2m_crc(b + 0x20, 0x28), get_unaligned_le32(b + 0x48));
++	for (i = 0; i < ARRAY_SIZE(size_off); i++)
++		total += get_unaligned_le16(b + size_off[i]);
++	dev_info(dev, "EXP-M2M: flags +0x22..+0x24 = %02x %02x %02x, block sizes %u %u %u %u %u (total %u, max %u)\n",
++		 b[0x22], b[0x23], b[0x24],
++		 get_unaligned_le16(b + 0x28), get_unaligned_le16(b + 0x2c), get_unaligned_le16(b + 0x30),
++		 get_unaligned_le16(b + 0x34), get_unaligned_le16(b + 0x38), total, EXP_M2M_SIZE - 0x4c);
++	if (!total || total > EXP_M2M_SIZE - 0x4c)
++		return;
++	for (i = 0; i < ARRAY_SIZE(size_off); i++) {
++		u32 sz = get_unaligned_le16(b + size_off[i]);
++
++		if (sz >= 4)
++			dev_info(dev, "EXP-M2M: block %u at 0x%04x, %u bytes: CRC %08x, stored %08x\n", i, off, sz,
++				 isp4sd_exp_m2m_crc(b + off, sz - 4), get_unaligned_le32(b + off + sz - 4));
++		off += sz;
++	}
++}
++
++static void isp4sd_exp_m2m_read(struct device *dev)
++{
++	struct device *sdev;
++	struct i2c_client *client;
++	int ret = 0, pm;
++	u32 off;
++
++	if (!m2m_read || exp_m2m_done)
++		return;
++	sdev = bus_find_device_by_name(&i2c_bus_type, NULL, EXP_SENSOR_I2C_NAME);
++	client = sdev ? i2c_verify_client(sdev) : NULL;
++	if (!client) {
++		dev_err(dev, "EXP-M2M: no I2C device %s\n", EXP_SENSOR_I2C_NAME);
++		goto out;
++	}
++
++	pm = pm_runtime_resume_and_get(&client->dev);	/* the module memory shares the sensor's supply */
++	for (off = 0; off < EXP_M2M_SIZE && !ret; off += EXP_M2M_CHUNK)
++		ret = isp4sd_exp_m2m_rd(client, off, exp_m2m_buf + off, min_t(u32, EXP_M2M_SIZE - off, EXP_M2M_CHUNK));
++	if (pm >= 0)
++		pm_runtime_put(&client->dev);
++	dev_info(dev, "EXP-M2M: read %u bytes from I2C 0x%02x (sensor power ref %d) -> %d\n",
++		 EXP_M2M_SIZE, EXP_M2M_I2C_ADDR, pm, ret);
++	if (ret)
++		goto out;
++
++	exp_m2m_done = true;
++	isp4sd_exp_m2m_check(dev, exp_m2m_buf);
++	if (m2m_read >= 2)
++		print_hex_dump(KERN_INFO, "EXP-M2M-DUMP: ", DUMP_PREFIX_OFFSET, 32, 1,
++			       exp_m2m_buf, EXP_M2M_SIZE, false);
++out:
++	put_device(sdev);
++}
++
+ static int isp4sd_init_stream(struct isp4_subdev *isp_subdev)
+ {
+ 	struct device *dev = isp_subdev->dev;
+@@ -1060,6 +1167,9 @@
+ 		return ret;
+ 	}
+ 
++	/* EXPERIMENT (patch 0047): Windows sends SET_M2M_CAL_DATA here; step 1 only reads the data */
++	isp4sd_exp_m2m_read(dev);
++
+ 	/* EXPERIMENT (patch 0028): Windows then selects the tuning scenario (0 = preview) */
+ 	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_TUNING_SCENARIO, EXP_CMD_ID_APPLY_TUNING_SCENARIO,
+ 			   "APPLY_TUNING_SCENARIO", (const u32 []){ 0 }, 1);

@@ -1,0 +1,96 @@
+From: GZ302 camera enablement <local>
+Subject: [PATCH] platform/x86: amd: amd_isp4: register the OV13B10 reset GPIO
+
+The OV13B10's reset line on the ASUS ROG Flow Z13 (GZ302) is amdisp-pinctrl
+GPIO 0, active low. amdgpu registers sensor GPIO lookups only for the
+OMNI5C10 sensor, so until now the GZ302 lookup came from an amdgpu patch,
+which forces a custom kernel. Keep it with the rest of the GZ302 camera
+graph instead: register it in probe, before the i2c notifier can create the
+sensor's client, and remove it again in remove and on the error path.
+
+Used by the gz302-camera-dkms package (no-custom-kernel route); applies on
+top of 0002.
+
+---
+diff --git a/drivers/platform/x86/amd/amd_isp4.c b/drivers/platform/x86/amd/amd_isp4.c
+--- a/drivers/platform/x86/amd/amd_isp4.c
++++ b/drivers/platform/x86/amd/amd_isp4.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/err.h>
++#include <linux/gpio/machine.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -35,6 +36,7 @@
+ struct amdisp_platform_info {
+ 	struct i2c_board_info board_info;
+ 	const struct software_node **swnodes;
++	struct gpiod_lookup_table *gpio_table;	/* sensor GPIOs, registered before the i2c client exists */
+ };
+ 
+ /*
+@@ -362,12 +364,26 @@
+ 	NULL
+ };
+ 
++/*
++ * The OV13B10's reset line is amdisp-pinctrl GPIO 0, active low (the ISP reference platform's sensor enable). amdgpu
++ * only registers sensor GPIOs for the OMNI5C10 sensor, so the board data lives here, next to the rest of the GZ302
++ * graph, instead of in amdgpu (which would need a custom kernel). "i2c-ov13b10" is the client created below.
++ */
++static struct gpiod_lookup_table ov13b10_gpio_table = {
++	.dev_id = "i2c-ov13b10",
++	.table = {
++		GPIO_LOOKUP("amdisp-pinctrl", 0, "reset", GPIO_ACTIVE_LOW),
++		{ }
++	},
++};
++
+ static const struct amdisp_platform_info ov13b10_platform_config = {
+ 	.board_info = {
+ 		.dev_name = "ov13b10",
+ 		I2C_BOARD_INFO("ov13b10", AMDISP_OV13B10_I2C_ADDR),
+ 	},
+ 	.swnodes = ov13b10_amd_isp4_nodes,
++	.gpio_table = &ov13b10_gpio_table,
+ };
+ 
+ static const struct acpi_device_id amdisp_sensor_ids[] = {
+@@ -499,10 +515,14 @@
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(isp4_platform),
+ 				     "failed to prepare AMD ISP platform fwnode\n");
+ 
++	/* before the notifier below can create the sensor's i2c client */
++	if (pinfo->gpio_table)
++		gpiod_add_lookup_table(pinfo->gpio_table);
++
+ 	isp4_platform->i2c_nb.notifier_call = isp_i2c_bus_notify;
+ 	ret = bus_register_notifier(&i2c_bus_type, &isp4_platform->i2c_nb);
+ 	if (ret)
+-		goto error_unregister_sw_node;
++		goto error_remove_gpio_table;
+ 
+ 	adev = ACPI_COMPANION(&pdev->dev);
+ 	/* initialize root amd_camera_node */
+@@ -514,7 +534,9 @@
+ 	platform_set_drvdata(pdev, isp4_platform);
+ 	return 0;
+ 
+-error_unregister_sw_node:
++error_remove_gpio_table:
++	if (pinfo->gpio_table)
++		gpiod_remove_lookup_table(pinfo->gpio_table);
+ 	software_node_unregister_node_group(isp4_platform->pinfo->swnodes);
+ 	return ret;
+ }
+@@ -525,6 +547,8 @@
+ 
+ 	bus_unregister_notifier(&i2c_bus_type, &isp4_platform->i2c_nb);
+ 	i2c_unregister_device(isp4_platform->i2c_dev);
++	if (isp4_platform->pinfo->gpio_table)
++		gpiod_remove_lookup_table(isp4_platform->pinfo->gpio_table);
+ 	software_node_unregister_node_group(isp4_platform->pinfo->swnodes);
+ }
+ 

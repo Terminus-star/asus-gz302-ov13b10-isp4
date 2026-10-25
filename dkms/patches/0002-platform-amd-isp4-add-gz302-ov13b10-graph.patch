@@ -1,0 +1,163 @@
+From: GZ302 camera bring-up <local>
+Subject: [PATCH] platform/x86: amd_isp4: add GZ302 OV13B10 board graph
+
+The ASUS ROG Flow Z13 GZ302EA rear camera is an OmniVision OV13B10 exposed
+as ACPI HID OMNI13B1.  Its ACPI table supplies no camera resources or fwnode
+graph, so provide the ISP4 software-node graph required by the existing
+ov13b10 sensor driver.
+
+Use the address reported by the camera _DSM (0x10), four CSI-2 lanes and the
+OV13B10 driver's 560 MHz link frequency.  The 19.2 MHz declaration satisfies
+the driver's required external clock property; real clock validation remains
+part of hardware bring-up.
+
+---
+diff --git a/drivers/platform/x86/amd/amd_isp4.c b/drivers/platform/x86/amd/amd_isp4.c
+--- a/drivers/platform/x86/amd/amd_isp4.c
++++ b/drivers/platform/x86/amd/amd_isp4.c
+@@ -19,10 +19,13 @@
+ #define AMDISP_OV05C10_I2C_ADDR		0x10
+ #define AMDISP_OV05C10_HID		"OMNI5C10"
+ #define AMDISP_OV05C10_REMOTE_EP_NAME	"ov05c10_isp_4_1_1"
++#define AMDISP_OV13B10_I2C_ADDR		0x10
++#define AMDISP_OV13B10_HID		"OMNI13B1"
+ #define AMD_ISP_PLAT_DRV_NAME		"amd-isp4"
+ 
+ static const struct software_node isp4_mipi1_endpoint_node;
+ static const struct software_node ov05c10_endpoint_node;
++static const struct software_node ov13b10_endpoint_node;
+ 
+ /*
+  * AMD ISP platform info definition to initialize sensor
+@@ -245,8 +248,131 @@
+ 	.swnodes = amd_isp4_nodes,
+ };
+ 
++/*
++ * ASUS ROG Flow Z13 (GZ302EA) rear camera.  Its ACPI camera device has no
++ * resources or endpoint graph, so provide the same complete software-node
++ * graph used by the reference OV05C10 platform.  OV13B10's full-resolution
++ * mode requires four CSI-2 lanes at a 560 MHz link frequency.
++ */
++static const struct software_node ov13b10_amd_camera_node = {
++	.name = "amd_camera",
++};
++
++static const struct software_node ov13b10_isp4_node = {
++	.name = "isp4",
++	.parent = &ov13b10_amd_camera_node,
++};
++
++static const struct software_node ov13b10_isp4_ports = {
++	.name = "ports",
++	.parent = &ov13b10_isp4_node,
++};
++
++static const struct software_node ov13b10_isp4_port_node = {
++	.name = "port@0",
++	.parent = &ov13b10_isp4_ports,
++};
++
++static const struct software_node_ref_args ov13b10_isp4_refs[] = {
++	SOFTWARE_NODE_REFERENCE(&ov13b10_endpoint_node),
++};
++
++static const struct property_entry ov13b10_isp4_endpoint_props[] = {
++	PROPERTY_ENTRY_REF_ARRAY("remote-endpoint", ov13b10_isp4_refs),
++	{ }
++};
++
++static const struct software_node ov13b10_isp4_endpoint_node = {
++	.name = "endpoint",
++	.parent = &ov13b10_isp4_port_node,
++	.properties = ov13b10_isp4_endpoint_props,
++};
++
++static const struct property_entry ov13b10_i2c1_props[] = {
++	PROPERTY_ENTRY_U32("clock-frequency", 1 * HZ_PER_MHZ),
++	{ }
++};
++
++static const struct software_node ov13b10_i2c1_node = {
++	.name = "i2c1",
++	.parent = &ov13b10_amd_camera_node,
++	.properties = ov13b10_i2c1_props,
++};
++
++static const struct property_entry ov13b10_camera_props[] = {
++	PROPERTY_ENTRY_U32("clock-frequency", 19200000),
++	{ }
++};
++
++static const struct software_node ov13b10_camera_node = {
++	.name = AMDISP_OV13B10_HID,
++	.parent = &ov13b10_i2c1_node,
++	.properties = ov13b10_camera_props,
++};
++
++static const struct software_node ov13b10_ports = {
++	.name = "ports",
++	.parent = &ov13b10_camera_node,
++};
++
++static const struct software_node ov13b10_port_node = {
++	.name = "port@0",
++	.parent = &ov13b10_ports,
++};
++
++static const struct software_node_ref_args ov13b10_refs[] = {
++	SOFTWARE_NODE_REFERENCE(&ov13b10_isp4_endpoint_node),
++};
++
++static const u64 ov13b10_link_freqs[] = {
++	560 * HZ_PER_MHZ,
++};
++
++static const u32 ov13b10_data_lanes[] = {
++	1, 2, 3, 4,
++};
++
++static const struct property_entry ov13b10_endpoint_props[] = {
++	PROPERTY_ENTRY_U32("bus-type", 4),
++	PROPERTY_ENTRY_U32_ARRAY_LEN("data-lanes", ov13b10_data_lanes,
++				     ARRAY_SIZE(ov13b10_data_lanes)),
++	PROPERTY_ENTRY_U64_ARRAY_LEN("link-frequencies", ov13b10_link_freqs,
++				     ARRAY_SIZE(ov13b10_link_freqs)),
++	PROPERTY_ENTRY_REF_ARRAY("remote-endpoint", ov13b10_refs),
++	{ }
++};
++
++static const struct software_node ov13b10_endpoint_node = {
++	.name = "endpoint",
++	.parent = &ov13b10_port_node,
++	.properties = ov13b10_endpoint_props,
++};
++
++static const struct software_node *ov13b10_amd_isp4_nodes[] = {
++	&ov13b10_amd_camera_node,
++	&ov13b10_isp4_node,
++	&ov13b10_isp4_ports,
++	&ov13b10_isp4_port_node,
++	&ov13b10_isp4_endpoint_node,
++	&ov13b10_i2c1_node,
++	&ov13b10_camera_node,
++	&ov13b10_ports,
++	&ov13b10_port_node,
++	&ov13b10_endpoint_node,
++	NULL
++};
++
++static const struct amdisp_platform_info ov13b10_platform_config = {
++	.board_info = {
++		.dev_name = "ov13b10",
++		I2C_BOARD_INFO("ov13b10", AMDISP_OV13B10_I2C_ADDR),
++	},
++	.swnodes = ov13b10_amd_isp4_nodes,
++};
++
+ static const struct acpi_device_id amdisp_sensor_ids[] = {
+ 	{ AMDISP_OV05C10_HID, (kernel_ulong_t)&ov05c10_platform_config },
++	{ AMDISP_OV13B10_HID, (kernel_ulong_t)&ov13b10_platform_config },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(acpi, amdisp_sensor_ids);

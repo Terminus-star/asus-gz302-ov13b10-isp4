@@ -1,0 +1,31 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -117,6 +117,18 @@
+ MODULE_PARM_DESC(win_cmds,
+ 		 "EXPERIMENT: bit mask of extra Windows firmware commands: 1 RTA, 2 tuning scenario, 4 out-chan rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime range, 0x40 global ENABLE_PREFETCH (0 = none)");
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0030): with {1,1,1} the firmware hangs in MMhubPrefetchSingleStream during
++ * START_STREAM (findings section 80).  prefetch_flags picks the three ENABLE_PREFETCH payload words one bit
++ * each (bit 0 -> word 0, bit 1 -> word 1, bit 2 -> word 2) so the switch that causes the hang can be found.
++ * The firmware logs its reading as "RTPipe MMHub Prefetch", "SoftRTPipe MMHub Prefetch", "Add YUV GAP".
++ * Default 7 = {1,1,1}, the patch 0029 behaviour.  Only used when win_cmds has bit 0x40.
++ */
++static unsigned int prefetch_flags = 7;
++module_param(prefetch_flags, uint, 0444);
++MODULE_PARM_DESC(prefetch_flags,
++		 "EXPERIMENT: ENABLE_PREFETCH payload, bit N -> word N (0..2), default 7 = {1,1,1}; needs win_cmds bit 0x40");
++
+ /* Send one of the Windows-only commands if its bit is set; never fails the bring-up, only logs the result. */
+ static void isp4sd_exp_win_cmd(struct isp4_subdev *isp_subdev, unsigned int bit, u32 cmd_id,
+ 			       const char *name, const u32 *words, u32 count)
+@@ -635,7 +647,8 @@
+ 
+ 	/* EXPERIMENT (patch 0029): Windows enables MMHUB prefetch (global command) before the fps range */
+ 	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_PREFETCH, EXP_CMD_ID_ENABLE_PREFETCH, "ENABLE_PREFETCH",
+-			   (const u32 []){ 1, 1, 1 }, 3);
++			   (const u32 []){ prefetch_flags & 1, (prefetch_flags >> 1) & 1,
++					   (prefetch_flags >> 2) & 1 }, 3);	/* patch 0030 */
+ 
+ 	/* EXPERIMENT (patch 0028): Windows sends the fps and integration time ranges after the META buffers */
+ 	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_FPS_RANGE, EXP_CMD_ID_SET_FPS_RANGE,

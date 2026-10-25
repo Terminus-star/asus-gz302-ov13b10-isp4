@@ -1,0 +1,219 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -278,6 +278,70 @@
+ 	dev_info(dev, "EXP-VCM: host test write, position %u: %02X %02X -> %d\n", pos, b1, b2, ret);
+ }
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0043): host-driven manual focus behind V4L2_CID_FOCUS_ABSOLUTE.
++ * At every sensor start: Windows' motor init (DF 5B) and then the current position as a mode-1 frame
++ * (with the default 400 that is 19 04, i.e. exactly what Windows sends). While the sensor streams, a
++ * control change is written to the motor at once. exp_focus_lock serialises control changes against
++ * sensor start/stop; exp_focus_client is only set while the sensor is powered and streaming.
++ */
++static bool focus_control = true;
++module_param(focus_control, bool, 0444);
++MODULE_PARM_DESC(focus_control,
++		 "EXPERIMENT: manual focus control (V4L2 focus_absolute 0..1023) written to the motor by the host; replaces vcm_init (default on)");
++
++static DEFINE_MUTEX(exp_focus_lock);
++static u32 exp_focus_pos = ISP4SD_FOCUS_DEFAULT;
++static struct i2c_client *exp_focus_client;
++
++static int isp4sd_exp_focus_write(struct i2c_client *client, u32 pos)
++{
++	return isp4sd_exp_vcm_wr(client, (pos >> 4) & 0x3f, ((pos & 0xf) << 4) | 0x04);
++}
++
++bool isp4sd_focus_control_enabled(void)
++{
++	return focus_control;
++}
++
++void isp4sd_set_focus(s32 pos)
++{
++	int ret;
++
++	mutex_lock(&exp_focus_lock);
++	exp_focus_pos = clamp(pos, 0, ISP4SD_FOCUS_MAX);
++	if (exp_focus_client) {
++		ret = isp4sd_exp_focus_write(exp_focus_client, exp_focus_pos);
++		dev_dbg(&exp_focus_client->dev, "EXP-FOCUS: position %u -> %d\n", exp_focus_pos, ret);
++	}
++	mutex_unlock(&exp_focus_lock);
++}
++
++/* Sensor powered (caller's responsibility): motor init + current position; else the old vcm_init. */
++static void isp4sd_exp_focus_start(struct device *dev, struct i2c_client *client, const char *when)
++{
++	int r1, r2;
++
++	if (!focus_control) {
++		isp4sd_exp_vcm_init(dev, client, when);
++		return;
++	}
++	mutex_lock(&exp_focus_lock);
++	r1 = isp4sd_exp_vcm_wr(client, 0xdf, 0x5b);
++	r2 = isp4sd_exp_focus_write(client, exp_focus_pos);
++	mutex_unlock(&exp_focus_lock);
++	dev_info(dev, "EXP-FOCUS: motor init %s: DF 5B -> %d, position %u -> %d\n",
++		 when, r1, exp_focus_pos, r2);
++}
++
++/* from now on control changes go straight to the motor (NULL = sensor stopped) */
++static void isp4sd_exp_focus_attach(struct i2c_client *client)
++{
++	mutex_lock(&exp_focus_lock);
++	exp_focus_client = focus_control ? client : NULL;
++	mutex_unlock(&exp_focus_lock);
++}
++
+ /* PLL, stream and MIPI timing registers that differ or matter between the Windows and Linux tables */
+ static const u16 exp_pll_regs[] = {
+ 	0x0100, 0x0303, 0x0305, 0x0321, 0x0323, 0x0324, 0x0325, 0x0326, 0x0327, 0x3011, 0x4800, 0x4837,
+@@ -443,15 +507,17 @@
+ 
+ 	/* patch 0040: like Windows, with the sensor powered and before it streams (needs the PM reference) */
+ 	if (pm_ref >= 0)
+-		isp4sd_exp_vcm_init(dev, client, "before s_stream");
++		isp4sd_exp_focus_start(dev, client, "before s_stream");	/* patch 0043 */
+ 
+ 	ret = v4l2_subdev_call(sd, video, s_stream, 1);
+ 	dev_info(dev, "EXP-SENSOR: %s s_stream(1) %s START_STREAM -> %d\n", sd->name, when, ret);
+ 	/* patch 0040: without the PHY start's PM reference, init the motor once the sensor is powered by s_stream */
+ 	if (!ret && pm_ref < 0)
+-		isp4sd_exp_vcm_init(dev, client, "after s_stream");
++		isp4sd_exp_focus_start(dev, client, "after s_stream");	/* patch 0043 */
+ 	if (!ret)
+ 		isp4sd_exp_vcm_test(dev, client);	/* patch 0042 */
++	if (!ret)
++		isp4sd_exp_focus_attach(client);	/* patch 0043 */
+ 	if (!ret && sensor_pll) {
+ 		/* patch 0025: what the sensor really got, and optionally the Windows PLL values */
+ 		isp4sd_exp_pll_dump(dev, client, "after s_stream");
+@@ -496,6 +562,7 @@
+ 	if (!exp_sensor_dev)
+ 		return;
+ 
++	isp4sd_exp_focus_attach(NULL);	/* patch 0043: no motor writes once the sensor stops */
+ 	ret = v4l2_subdev_call(exp_sensor_sd, video, s_stream, 0);
+ 	dev_info(dev, "EXP-SENSOR: %s s_stream(0) -> %d\n", exp_sensor_sd->name, ret);
+ 	put_device(exp_sensor_dev);
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.h
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.h
+@@ -124,4 +124,14 @@
+ int isp4sd_pwron_and_init(struct v4l2_subdev *sd);
+ int isp4sd_pwroff_and_deinit(struct v4l2_subdev *sd);
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0043): manual focus from the host. The focus motor works when the host
++ * writes it (findings 111) while the firmware's AF path does not reach it, so the video device offers
++ * V4L2_CID_FOCUS_ABSOLUTE 0..1023 and the subdev writes the motor. 400 = Windows' parking position.
++ */
++#define ISP4SD_FOCUS_MAX	1023
++#define ISP4SD_FOCUS_DEFAULT	400
++bool isp4sd_focus_control_enabled(void);
++void isp4sd_set_focus(s32 pos);
++
+ #endif /* _ISP4_SUBDEV_H_ */
+--- a/drivers/media/platform/amd/isp4/isp4_video.c
++++ b/drivers/media/platform/amd/isp4/isp4_video.c
+@@ -3,6 +3,7 @@
+  * Copyright (C) 2025 Advanced Micro Devices, Inc.
+  */
+ 
++#include <media/v4l2-event.h>
+ #include <media/v4l2-ioctl.h>
+ #include <media/v4l2-mc.h>
+ #include <media/videobuf2-vmalloc.h>
+@@ -402,6 +403,9 @@
+ 	.vidioc_s_parm              = isp4vid_ioctl_g_param,
+ 	.vidioc_enum_framesizes     = isp4vid_enum_framesizes,
+ 	.vidioc_enum_frameintervals = isp4vid_ioctl_enum_frameintervals,
++	/* patch 0043: control change events for the focus control */
++	.vidioc_subscribe_event     = v4l2_ctrl_subscribe_event,
++	.vidioc_unsubscribe_event   = v4l2_event_unsubscribe,
+ };
+ 
+ static unsigned int isp4vid_get_image_size(struct v4l2_pix_format *fmt)
+@@ -701,6 +705,22 @@
+ 	.buf_queue = isp4vid_qops_buffer_queue,
+ };
+ 
++/* EXPERIMENT (GZ302, patch 0043): the focus control moves the lens through the subdev (host I2C) */
++static int isp4vid_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	switch (ctrl->id) {
++	case V4L2_CID_FOCUS_ABSOLUTE:
++		isp4sd_set_focus(ctrl->val);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct v4l2_ctrl_ops isp4vid_ctrl_ops = {
++	.s_ctrl = isp4vid_s_ctrl,
++};
++
+ int isp4vid_dev_init(struct isp4vid_dev *isp_vdev, struct v4l2_subdev *isp_sd)
+ {
+ 	const char *vdev_name = isp4vid_video_dev_name;
+@@ -784,15 +804,29 @@
+ 	strscpy(vdev->name, vdev_name, sizeof(vdev->name));
+ 	video_set_drvdata(vdev, isp_vdev);
+ 
++	/* patch 0043: focus_absolute, only when the host-driven focus is enabled */
++	v4l2_ctrl_handler_init(&isp_vdev->ctrl_handler, 1);
++	if (isp4sd_focus_control_enabled())
++		v4l2_ctrl_new_std(&isp_vdev->ctrl_handler, &isp4vid_ctrl_ops,
++				  V4L2_CID_FOCUS_ABSOLUTE, 0, ISP4SD_FOCUS_MAX, 1,
++				  ISP4SD_FOCUS_DEFAULT);
++	if (isp_vdev->ctrl_handler.error) {
++		ret = isp_vdev->ctrl_handler.error;
++		dev_err(v4l2_dev->dev, "control handler init fail:%d\n", ret);
++		goto err_free_ctrls;
++	}
++	vdev->ctrl_handler = &isp_vdev->ctrl_handler;
++
+ 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+ 	if (ret) {
+ 		dev_err(v4l2_dev->dev, "register video device fail:%d\n", ret);
+-		goto err_entity_cleanup;
++		goto err_free_ctrls;
+ 	}
+ 
+ 	return 0;
+ 
+-err_entity_cleanup:
++err_free_ctrls:
++	v4l2_ctrl_handler_free(&isp_vdev->ctrl_handler);
+ 	media_entity_cleanup(&isp_vdev->vdev.entity);
+ err_release_vb2_queue:
+ 	vb2_queue_release(q);
+@@ -802,4 +836,5 @@
+ void isp4vid_dev_deinit(struct isp4vid_dev *isp_vdev)
+ {
+ 	vb2_video_unregister_device(&isp_vdev->vdev);
++	v4l2_ctrl_handler_free(&isp_vdev->ctrl_handler);	/* patch 0043 */
+ }
+--- a/drivers/media/platform/amd/isp4/isp4_video.h
++++ b/drivers/media/platform/amd/isp4/isp4_video.h
+@@ -6,6 +6,7 @@
+ #ifndef _ISP4_VIDEO_H_
+ #define _ISP4_VIDEO_H_
+ 
++#include <media/v4l2-ctrls.h>
+ #include <media/v4l2-dev.h>
+ #include <media/videobuf2-memops.h>
+ 
+@@ -45,6 +46,9 @@
+ 	struct device *dev;
+ 	struct v4l2_subdev *isp_sdev;
+ 	struct v4l2_fract timeperframe;
++
++	/* EXPERIMENT (GZ302, patch 0043): focus_absolute control */
++	struct v4l2_ctrl_handler ctrl_handler;
+ };
+ 
+ int isp4vid_dev_init(struct isp4vid_dev *isp_vdev, struct v4l2_subdev *isp_sd);

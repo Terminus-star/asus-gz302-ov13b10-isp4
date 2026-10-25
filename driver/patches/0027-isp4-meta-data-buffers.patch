@@ -1,0 +1,91 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -323,6 +323,39 @@
+ /* align 32KB */
+ #define ISP4SD_META_BUF_SIZE ALIGN(sizeof(struct isp4fw_meta_info), 0x8000)
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0027): the ISP firmware asks the host for four buffers of type 13 every time a stream
++ * is set up (BUF_MGR "PopFrontBuffer: BUF|queue empty:type=13"), and the Linux driver never sends any.  type 13 =
++ * BUFFER_TYPE_META_DATA in the Windows driver (findings section 65).  Windows (isp_send_metadata_buf) allocates 6
++ * buffers of 0x20000 bytes, NOT cleared, and sends them with SEND_BUFFER right before the 6 META_INFO (type 10)
++ * buffers, vmid_space space = 4, before START_STREAM.  meta_data_bufs=N sends N of them (0 = off, max 6).
++ */
++#define EXP_BUFFER_TYPE_META_DATA	13
++#define EXP_META_DATA_BUF_SIZE		0x20000
++#define EXP_META_DATA_BUF_MAX		6
++
++static unsigned int meta_data_bufs;
++module_param(meta_data_bufs, uint, 0444);
++MODULE_PARM_DESC(meta_data_bufs,
++		 "EXPERIMENT: send N (max 6) type-13 META_DATA buffers of 128 KiB before START_STREAM, like Windows (0 = off)");
++
++struct exp_meta_data_buf {
++	void *handle;
++	u64 gpu_addr;
++	void *cpu_addr;
++};
++
++static struct exp_meta_data_buf exp_meta_data[EXP_META_DATA_BUF_MAX];
++static unsigned int exp_meta_data_cnt;
++
++static void isp4sd_exp_meta_data_free(void)
++{
++	for (unsigned int i = 0; i < exp_meta_data_cnt; i++)
++		isp_kernel_buffer_free(&exp_meta_data[i].handle, &exp_meta_data[i].gpu_addr,
++				       &exp_meta_data[i].cpu_addr);
++	exp_meta_data_cnt = 0;
++}
++
+ #define to_isp4_subdev(sd) container_of(sd, struct isp4_subdev, sdev)
+ 
+ static const char *isp4sd_entity_name = "amd isp4";
+@@ -426,6 +459,40 @@
+ 	 * compilers.
+ 	 */
+ 	memset(&buf_type, 0, sizeof(buf_type));
++
++	/* patch 0027: type-13 META_DATA buffers first, as Windows does (allocated once, kept until module unload) */
++	if (meta_data_bufs) {
++		unsigned int want = min_t(unsigned int, meta_data_bufs, EXP_META_DATA_BUF_MAX);
++
++		while (exp_meta_data_cnt < want) {
++			struct exp_meta_data_buf *b = &exp_meta_data[exp_meta_data_cnt];
++			int ret = isp_kernel_buffer_alloc(dev, EXP_META_DATA_BUF_SIZE, &b->handle, &b->gpu_addr,
++							  &b->cpu_addr);
++
++			if (ret) {
++				dev_err(dev, "EXP: alloc of type-13 buffer %u failed: %d\n", exp_meta_data_cnt, ret);
++				return ret;
++			}
++			exp_meta_data_cnt++;
++		}
++		for (unsigned int i = 0; i < want; i++) {
++			int ret;
++
++			buf_type.buffer_type = EXP_BUFFER_TYPE_META_DATA;
++			buf_type.buffer.vmid_space.bit.space = ISP4FW_ADDR_SPACE_TYPE_GPU_VA;
++			isp4if_split_addr64(exp_meta_data[i].gpu_addr, &buf_type.buffer.buf_base_a_lo,
++					    &buf_type.buffer.buf_base_a_hi);
++			buf_type.buffer.buf_size_a = EXP_META_DATA_BUF_SIZE;
++			ret = isp4if_send_command(ispif, ISP4FW_CMD_ID_SEND_BUFFER, &buf_type, sizeof(buf_type));
++			if (ret) {
++				dev_err(dev, "EXP: send type-13 buffer %u failed: %d\n", i, ret);
++				return ret;
++			}
++		}
++		dev_info(dev, "EXP: sent %u type-13 META_DATA buffers of 0x%x bytes\n", want, EXP_META_DATA_BUF_SIZE);
++		memset(&buf_type, 0, sizeof(buf_type));
++	}
++
+ 	for (unsigned int i = 0; i < ISP4IF_MAX_STREAM_BUF_COUNT; i++) {
+ 		struct isp4if_gpu_mem_info *meta_info_buf =
+ 				isp_subdev->ispif.meta_info_buf[i];
+@@ -1380,6 +1447,7 @@
+ 	/* patch 0026: never leave the burst work pending when the module goes away */
+ 	cancel_delayed_work_sync(&exp_burst_work);
+ 	exp_burst_client = NULL;
++	isp4sd_exp_meta_data_free();	/* patch 0027 */
+ 
+ 	isp4vid_dev_deinit(&isp_subdev->isp_vdev);
+ 	v4l2_device_unregister_subdev(&isp_subdev->sdev);

@@ -1,0 +1,270 @@
+Note (2026-10-19): the new file this patch originally added, isp4_phy_seq.h, was removed from it: it holds
+data derived from the Windows driver and is not published; the tool that generated it is no longer in the
+repository, so this step can only be rebuilt with a locally generated copy.
+Since patch 0037 the driver no longer compiles it in (it loads amdgpu/gz302-ov13b-phy-seq.bin as firmware).
+
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -16,6 +16,7 @@
+ /* EXPERIMENT (GZ302): payloads generated from the Windows driver (not published) */
+ #include "isp4_ov13b_script.h"
+ #include "isp4_ov13b_sensor_prop.h"
++#include "isp4_phy_seq.h"
+ 
+ /* EXPERIMENT (GZ302): firmware-visible copy of the tuning file, see isp4if_replay_tuning() */
+ static struct isp4if_gpu_mem_info *exp_tuning_mem;
+@@ -924,6 +925,166 @@
+ }
+ 
+ /*
++ * EXPERIMENT (GZ302): start the MIPI D-PHY receiver from the host, as the Windows driver does for the
++ * Strix variants (findings section 41, function startup_seq_cdphy_rx).  The firmware arms the receiver but
++ * counts zero frame starts although the sensor streams, and the Linux ISP4 driver has no PHY code.
++ * The analog register list (isp4_phy_seq[]) was evaluated offline for phy 0, 1120 Mbps, 4 lanes.
++ * Off unless phy_init=1; called from the sensor start helper, with the sensor powered.
++ *
++ * Registers are ISP byte offsets, as in the Windows driver.  NOTE the mapping: ispif->mmio only covers
++ * 0x0-0x629a4 (amdgpu's "isp_4_1_1_reg" resource); the PHY controller (0x66700-0x67430) is a separate resource
++ * ("isp_4_1_1_phy0_reg") and the global PHY reset 0x66108 lies in neither, so the first version of this code
++ * oopsed on 0x66108.  The range 0x66000-0x67fff is therefore mapped separately below, from the physical start
++ * of the capture device's register resource.  Per-PHY controller at 0x66700 + 0x80 * phy for phy 0/1 (phy 0 is
++ * used): +0x00 control (3 = enable), +0x04 mode (0 = D-PHY), +0x10 lane enable mask, +0x14 lane reset, +0x1c
++ * status (bit 0 = ready), +0x24/+0x28 indirect PHY register address/data.  0x66108 is the global PHY reset
++ * (bit = phy).  Lane stop-state status lives at 0x68008, outside any mapped range, so it is read through the
++ * index/data pair at 0x61f08/0x61f0c, which lies inside ispif->mmio.
++ */
++#define EXP_PHY_WIN		0x66000
++#define EXP_PHY_WIN_SIZE	0x2000
++#define EXP_PHY_GLOBAL_RESET	0x66108
++#define EXP_PHY_BASE		0x66700
++#define EXP_PHY_STOPSTATE	0x68008
++#define EXP_IND_INDEX		0x61f08
++#define EXP_IND_DATA		0x61f0c
++
++static bool phy_init;
++module_param(phy_init, bool, 0444);
++MODULE_PARM_DESC(phy_init,
++		 "EXPERIMENT: start the MIPI D-PHY receiver from the host like Windows (needs start_sensor)");
++
++bool isp4if_phy_init_enabled(void)
++{
++	return phy_init;
++}
++
++/* w = mapping of ISP offsets EXP_PHY_WIN.. (see above); off = absolute ISP byte offset inside that range */
++static u32 phy_rd32(void __iomem *w, u32 off)
++{
++	return readl(w + (off - EXP_PHY_WIN));
++}
++
++static void phy_wr32(void __iomem *w, u32 off, u32 val)
++{
++	writel(val, w + (off - EXP_PHY_WIN));
++}
++
++static u16 exp_phy_rd(void __iomem *w, u16 reg)
++{
++	phy_wr32(w, EXP_PHY_BASE + 0x24, reg);
++	return phy_rd32(w, EXP_PHY_BASE + 0x28) & 0xffff;
++}
++
++static void exp_phy_wr(void __iomem *w, u16 reg, u16 val)
++{
++	phy_wr32(w, EXP_PHY_BASE + 0x24, reg);
++	phy_wr32(w, EXP_PHY_BASE + 0x28, val);
++}
++
++/* Windows FUN_14005131c: replace the bits selected by mask with val shifted to the lowest set bit of mask. */
++static void exp_phy_rmw(void __iomem *w, u16 reg, u16 mask, u16 val)
++{
++	u16 old = exp_phy_rd(w, reg);
++	unsigned int sh = mask ? __ffs(mask) : 0;
++
++	exp_phy_wr(w, reg, (old & ~mask) | ((val << sh) & mask));
++}
++
++int isp4if_phy_init(struct isp4_interface *ispif)
++{
++	void __iomem *m = ispif->mmio;		/* only for the index/data pair at 0x61f08/0x61f0c */
++	struct device *dev = ispif->dev;
++	const u32 lane_mask = (2U << ISP4_PHY_SEQ_LANES) - 1;		/* 4 lanes: 0x1f */
++	const u32 lane_rst = (1U << ISP4_PHY_SEQ_LANES) - 1;		/* 4 lanes: 0xf */
++	struct resource *res;
++	void __iomem *w;
++	u32 r, ready = 0, stop = 0, want;
++	unsigned int i;
++
++	if (!phy_init)
++		return 0;
++
++	/* ISP offset 0 is the start of the capture device's first memory resource (see the comment above) */
++	res = platform_get_resource(to_platform_device(dev), IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(dev, "EXP-PHY: no memory resource on the capture device\n");
++		return -ENODEV;
++	}
++	w = ioremap(res->start + EXP_PHY_WIN, EXP_PHY_WIN_SIZE);
++	if (!w) {
++		dev_err(dev, "EXP-PHY: cannot map the PHY register range\n");
++		return -ENOMEM;
++	}
++	dev_info(dev, "EXP-PHY: mapped ISP offsets 0x%x-0x%x (physical 0x%llx)\n", EXP_PHY_WIN,
++		 EXP_PHY_WIN + EXP_PHY_WIN_SIZE - 1, (unsigned long long)(res->start + EXP_PHY_WIN));
++
++	dev_info(dev, "EXP-PHY: starting the D-PHY receiver (phy %d, %d Mbps, %d lanes), %zu register operations\n",
++		 ISP4_PHY_SEQ_PHY, ISP4_PHY_SEQ_RATE_MBPS, ISP4_PHY_SEQ_LANES, ARRAY_SIZE(isp4_phy_seq));
++	dev_info(dev, "EXP-PHY: before: global reset 0x%08x, ctl 0x%08x, status 0x%08x\n",
++		 phy_rd32(w, EXP_PHY_GLOBAL_RESET), phy_rd32(w, EXP_PHY_BASE),
++		 phy_rd32(w, EXP_PHY_BASE + 0x1c));
++
++	/* All-ones on every register means the block is not reachable (powered down, wrong address): do not write. */
++	if (phy_rd32(w, EXP_PHY_GLOBAL_RESET) == 0xffffffff && phy_rd32(w, EXP_PHY_BASE + 0x1c) == 0xffffffff) {
++		dev_err(dev, "EXP-PHY: PHY registers read as all-ones; not touching them\n");
++		iounmap(w);
++		return -EIO;
++	}
++
++	/* 1. pulse the PHY's bit in the global reset register */
++	r = phy_rd32(w, EXP_PHY_GLOBAL_RESET);
++	phy_wr32(w, EXP_PHY_GLOBAL_RESET, r | BIT(ISP4_PHY_SEQ_PHY));
++	usleep_range(1000, 1500);
++	r = phy_rd32(w, EXP_PHY_GLOBAL_RESET);
++	phy_wr32(w, EXP_PHY_GLOBAL_RESET, r & ~BIT(ISP4_PHY_SEQ_PHY));
++
++	/* 2. disable, lane masks, D-PHY mode */
++	phy_wr32(w, EXP_PHY_BASE + 0x00, 0);
++	phy_wr32(w, EXP_PHY_BASE + 0x14, lane_rst | 0x10);
++	phy_wr32(w, EXP_PHY_BASE + 0x10, lane_mask);
++	phy_wr32(w, EXP_PHY_BASE + 0x04, 0);
++
++	/* 3. analog configuration */
++	for (i = 0; i < ARRAY_SIZE(isp4_phy_seq); i++) {
++		const struct isp4_phy_op *op = &isp4_phy_seq[i];
++
++		if (op->kind == ISP4_PHY_OP_RMW)
++			exp_phy_rmw(w, op->reg, op->mask, op->val);
++		else
++			exp_phy_wr(w, op->reg, op->val);
++	}
++
++	/* 4. enable and wait for "PHY ready" (Windows waits without a limit; here at most about 100 ms) */
++	phy_wr32(w, EXP_PHY_BASE + 0x00, 3);
++	for (i = 0; i < 100; i++) {
++		usleep_range(1000, 1500);
++		ready = phy_rd32(w, EXP_PHY_BASE + 0x1c);
++		if (ready & 1)
++			break;
++	}
++
++	/* 5. lane stop-state: bits 15:8 of the status must contain the lane mask (here: at most 5 tries, then carry on) */
++	want = lane_mask;
++	for (i = 0; i < 5; i++) {
++		usleep_range(1000, 1500);
++		isp4hw_wreg(m, EXP_IND_INDEX, EXP_PHY_STOPSTATE);
++		stop = isp4hw_rreg(m, EXP_IND_DATA);
++		if (((stop >> 8) & want) == want)
++			break;
++	}
++
++	/* 6. release the lane resets (keep nothing of the 0x1f bits) */
++	phy_wr32(w, EXP_PHY_BASE + 0x14, lane_rst & 0xffffffe0);
++
++	dev_info(dev, "EXP-PHY: done: PHY ready %s (status 0x%08x), lane stop-state 0x%08x (want bits 15:8 = 0x%02x: %s), after: ctl 0x%08x\n",
++		 (ready & 1) ? "yes" : "NO", ready, stop, want, (((stop >> 8) & want) == want) ? "yes" : "NO",
++		 phy_rd32(w, EXP_PHY_BASE));
++	iounmap(w);
++	return (ready & 1) ? 0 : -ETIMEDOUT;
++}
++
++/*
+  * SET_TUNING_DATA (0x02050008), decoded from amdcamera.sys (findings section 28).  The firmware
+  * log says "Host setfile buf queue empty" / "RTA setfile buf empty" and fails START_STREAM
+  * (error 0x27) because the host never delivers the sensor tuning file.  Windows copies the file
+--- a/drivers/media/platform/amd/isp4/isp4_interface.h
++++ b/drivers/media/platform/amd/isp4/isp4_interface.h
+@@ -115,6 +115,10 @@
+ /* EXPERIMENT (GZ302 bring-up): log ring-buffer and interrupt state, see isp4_interface.c */
+ void isp4if_dump_rings(struct isp4_interface *ispif, const char *when);
+ 
++/* EXPERIMENT (GZ302 bring-up): host-side MIPI D-PHY receiver start like Windows, no-op unless phy_init=1 */
++bool isp4if_phy_init_enabled(void);
++int isp4if_phy_init(struct isp4_interface *ispif);
++
+ /* EXPERIMENT (GZ302 bring-up): replay of the Windows sensor setup, no-op unless replay_sensor_setup=1 */
+ int isp4if_replay_sensor_setup(struct isp4_interface *ispif);
+ 
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -88,12 +88,13 @@
+ 		 pm_runtime_active(&client->dev));
+ }
+ 
+-static void isp4sd_exp_sensor_start(struct device *dev, const char *when)
++static void isp4sd_exp_sensor_start(struct device *dev, struct isp4_interface *ispif, const char *when)
+ {
+ 	struct device *sdev;
+ 	struct i2c_client *client;
+ 	struct v4l2_subdev *sd;
+ 	int ret;
++	int pm_ref = -1;
+ 
+ 	if (!start_sensor || exp_sensor_dev)
+ 		return;
+@@ -126,8 +127,21 @@
+ 
+ 	isp4sd_exp_i2c_probe(dev, client, "before s_stream");
+ 
++	/*
++	 * Windows starts the D-PHY receiver with the sensor powered and before the sensor streams.  Hold a
++	 * runtime-PM reference on the sensor across the PHY start and s_stream, so it is not powered down in between.
++	 */
++	if (isp4if_phy_init_enabled()) {
++		pm_ref = pm_runtime_resume_and_get(&client->dev);
++		dev_info(dev, "EXP-SENSOR: powered the sensor for the PHY start: %d\n", pm_ref);
++		ret = isp4if_phy_init(ispif);
++		dev_info(dev, "EXP-SENSOR: PHY start returned %d\n", ret);
++	}
++
+ 	ret = v4l2_subdev_call(sd, video, s_stream, 1);
+ 	dev_info(dev, "EXP-SENSOR: %s s_stream(1) %s START_STREAM -> %d\n", sd->name, when, ret);
++	if (pm_ref >= 0)
++		pm_runtime_put(&client->dev);
+ 	if (ret) {
+ 		isp4sd_exp_i2c_probe(dev, client, "after failed s_stream");
+ 		put_device(sdev);
+@@ -354,7 +368,7 @@
+ 		int ret;
+ 
+ 		if (start_sensor == 2)
+-			isp4sd_exp_sensor_start(dev, "before");
++			isp4sd_exp_sensor_start(dev, ispif, "before");
+ 
+ 		ret = isp4if_send_command(ispif, ISP4FW_CMD_ID_START_STREAM,
+ 					  NULL, 0);
+@@ -369,7 +383,7 @@
+ 		isp4if_dump_rings(ispif, "after START_STREAM queued (kickoff)");
+ 		sensor_info->start_stream_cmd_sent = true;
+ 		if (start_sensor == 1)
+-			isp4sd_exp_sensor_start(dev, "after");
++			isp4sd_exp_sensor_start(dev, ispif, "after");
+ 	} else {
+ 		dev_dbg(dev,
+ 			"no send START_STREAM, start_sent %u, buf_sent %u\n",
+@@ -1018,7 +1032,7 @@
+ 
+ 		if (isp_subdev->sensor_info.buf_sent_cnt >= min_start_bufs) {
+ 			if (start_sensor == 2)
+-				isp4sd_exp_sensor_start(dev, "before");
++				isp4sd_exp_sensor_start(dev, ispif, "before");
+ 
+ 			ret = isp4if_send_command(ispif,
+ 						  ISP4FW_CMD_ID_START_STREAM,
+@@ -1039,7 +1053,7 @@
+ 			isp_subdev->sensor_info.status =
+ 				ISP4SD_START_STATUS_STARTED;
+ 			if (start_sensor == 1)
+-				isp4sd_exp_sensor_start(dev, "after");
++				isp4sd_exp_sensor_start(dev, ispif, "after");
+ 		} else {
+ 			dev_dbg(dev,
+ 				"no send start, required %u, buf sent %u\n",

@@ -1,0 +1,79 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -3,6 +3,7 @@
+  * Copyright (C) 2025 Advanced Micro Devices, Inc.
+  */
+ 
++#include <linux/moduleparam.h>
+ #include <linux/pm_domain.h>
+ #include <linux/units.h>
+ 
+@@ -13,6 +14,16 @@
+ 
+ #define ISP4SD_MIN_BUF_CNT_BEF_START_STREAM 4
+ 
++/*
++ * EXPERIMENT (GZ302 bring-up, not for upstream): make the buffer count that
++ * gates ISP4FW_CMD_ID_START_STREAM tunable.  The default keeps the stock value
++ * so loading the module without the parameter behaves exactly as before.
++ */
++static unsigned int min_start_bufs = ISP4SD_MIN_BUF_CNT_BEF_START_STREAM;
++module_param(min_start_bufs, uint, 0644);
++MODULE_PARM_DESC(min_start_bufs,
++		 "EXPERIMENT: buffers sent to the ISP before START_STREAM (default 4, use >= 1)");
++
+ #define ISP4SD_PERFORMANCE_STATE_LOW 0
+ #define ISP4SD_PERFORMANCE_STATE_HIGH 1
+ 
+@@ -211,14 +222,17 @@
+ 	sensor_info->status = ISP4SD_START_STATUS_OFF;
+ 
+ 	if (!sensor_info->start_stream_cmd_sent &&
+-	    sensor_info->buf_sent_cnt >= ISP4SD_MIN_BUF_CNT_BEF_START_STREAM) {
++	    sensor_info->buf_sent_cnt >= min_start_bufs) {
+ 		int ret = isp4if_send_command(ispif, ISP4FW_CMD_ID_START_STREAM,
+ 					      NULL, 0);
+ 		if (ret) {
+-			dev_err(dev, "fail to start stream\n");
++			dev_err(dev, "EXP: START_STREAM failed (kickoff), ret %d, buf_sent %u, min %u\n",
++				ret, sensor_info->buf_sent_cnt, min_start_bufs);
+ 			return ret;
+ 		}
+ 
++		dev_info(dev, "EXP: START_STREAM queued to fw (kickoff), buf_sent %u, min %u\n",
++			 sensor_info->buf_sent_cnt, min_start_bufs);
+ 		sensor_info->start_stream_cmd_sent = true;
+ 	} else {
+ 		dev_dbg(dev,
+@@ -856,15 +870,19 @@
+ 	if (!isp_subdev->sensor_info.start_stream_cmd_sent) {
+ 		isp_subdev->sensor_info.buf_sent_cnt++;
+ 
+-		if (isp_subdev->sensor_info.buf_sent_cnt >=
+-		    ISP4SD_MIN_BUF_CNT_BEF_START_STREAM) {
++		if (isp_subdev->sensor_info.buf_sent_cnt >= min_start_bufs) {
+ 			ret = isp4if_send_command(ispif,
+ 						  ISP4FW_CMD_ID_START_STREAM,
+ 						  NULL, 0);
+ 			if (ret) {
+-				dev_err(dev, "fail to START_STREAM");
++				dev_err(dev, "EXP: START_STREAM failed (img buf), ret %d, buf_sent %u, min %u\n",
++					ret, isp_subdev->sensor_info.buf_sent_cnt,
++					min_start_bufs);
+ 				goto error_release_buf_node;
+ 			}
++			dev_info(dev, "EXP: START_STREAM queued to fw (img buf), buf_sent %u, min %u\n",
++				 isp_subdev->sensor_info.buf_sent_cnt,
++				 min_start_bufs);
+ 			isp_subdev->sensor_info.start_stream_cmd_sent = true;
+ 			isp_subdev->sensor_info.output_info.start_status =
+ 				ISP4SD_START_STATUS_STARTED;
+@@ -873,7 +891,7 @@
+ 		} else {
+ 			dev_dbg(dev,
+ 				"no send start, required %u, buf sent %u\n",
+-				ISP4SD_MIN_BUF_CNT_BEF_START_STREAM,
++				min_start_bufs,
+ 				isp_subdev->sensor_info.buf_sent_cnt);
+ 		}
+ 	}

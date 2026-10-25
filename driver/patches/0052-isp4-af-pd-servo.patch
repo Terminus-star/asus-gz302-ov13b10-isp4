@@ -1,0 +1,104 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -709,10 +709,10 @@
+  * so it runs from a work item; a newer target replaces one not yet written. Default 0 = off; while on, the AF
+  * owns the lens (focus_absolute changes are overwritten by the next target).
+  */
+-static bool af_drive;
+-module_param(af_drive, bool, 0444);
++static unsigned int af_drive;	/* patch 0052: 0 off, 1 firmware target (0050/0051), 2 host PDAF servo */
++module_param(af_drive, uint, 0444);
+ MODULE_PARM_DESC(af_drive,
+-		 "EXPERIMENT: drive the focus motor with the firmware's per-frame AF lens target (via firmware I2C); default off");
++		 "EXPERIMENT: drive the focus motor via firmware I2C: 0 off (default), 1 the firmware's AF target, 2 host servo on the firmware's phase-detection defocus (interim fix)");
+ 
+ static int exp_af_pending = -1;		/* motor position to write, -1 = none (xchg) */
+ static int exp_af_last = -1;		/* last position queued in this stream */
+@@ -756,11 +756,61 @@
+ 	       (exp_af_alg[i] - exp_af_alg[i - 1]);
+ }
+ 
++/* the lens's useful range from the two anchors (patch 0051); shared with the servo of patch 0052 */
++static int isp4sd_exp_af_clamp(int code)
++{
++	return clamp(code, max(af_inf_code - 50, 0), min(af_macro_code + 60, ISP4SD_FOCUS_MAX));
++}
++
+ static int isp4sd_exp_af_real_to_code(int real)
+ {
+-	int code = af_inf_code + (real - 940) * (af_macro_code - af_inf_code) / (2220 - 940);
++	return isp4sd_exp_af_clamp(af_inf_code + (real - 940) * (af_macro_code - af_inf_code) / (2220 - 940));
++}
+ 
+-	return clamp(code, max(af_inf_code - 50, 0), min(af_macro_code + 60, ISP4SD_FOCUS_MAX));
++/*
++ * EXPERIMENT (GZ302, patch 0052), INTERIM FIX: af_drive=2. On Windows the firmware moves the lens itself; on Linux
++ * its move step never runs and it keeps believing the lens has not moved, so its target settles short of focus
++ * (findings 132). Its phase-detection defocus (3A result +0xe8, s32) is measured from the image and is right
++ * wherever the lens is: positive below focus, negative past it, about -2.6 per motor code near focus. So the host
++ * moves the lens itself: every second frame (the lens moves and the next measurement must see it), after the first
++ * 8 frames (Windows' AF starts at frame 9; the first readings jump while exposure ramps up),
++ *   code += defocus / af_pd_div, limited to +-af_pd_max_step, no move while |defocus| < af_pd_deadband,
++ * clamped to the lens range. Starts from the current focus_absolute position. The firmware's AF state stays
++ * meaningless (it still thinks the lens never moved); its low-texture fallback is not used.
++ */
++static unsigned int af_pd_div = 6;
++module_param(af_pd_div, uint, 0444);
++MODULE_PARM_DESC(af_pd_div, "EXPERIMENT: af_drive=2: lens step = defocus / af_pd_div (default 6, ~40% of the error per step)");
++
++static unsigned int af_pd_max_step = 25;
++module_param(af_pd_max_step, uint, 0444);
++MODULE_PARM_DESC(af_pd_max_step, "EXPERIMENT: af_drive=2: largest lens step in motor codes (default 25)");
++
++static unsigned int af_pd_deadband = 15;
++module_param(af_pd_deadband, uint, 0444);
++MODULE_PARM_DESC(af_pd_deadband, "EXPERIMENT: af_drive=2: no move while |defocus| is below this (default 15)");
++
++static unsigned int exp_af_frames;	/* frames seen by the servo in this stream */
++
++/* returns the new motor code, or -1 for "no move this frame" */
++static int isp4sd_exp_af_servo(struct device *dev, const void *meta_info, const u8 *d)
++{
++	s32 defocus = (s32)get_unaligned_le32(d + 0xe8);
++	int step;
++
++	if (exp_af_last < 0)
++		exp_af_last = READ_ONCE(exp_focus_pos);
++	exp_af_frames++;
++	if (exp_af_frames <= 8 || (exp_af_frames & 1))
++		return -1;
++	if (abs(defocus) < af_pd_deadband)
++		return -1;
++	step = clamp(defocus / (int)max(af_pd_div, 1U), -(int)af_pd_max_step, (int)af_pd_max_step);
++	if (!step)
++		return -1;
++	dev_info(dev, "EXP-AF: poc %u: defocus %d -> code %d -> %d\n", get_unaligned_le32(meta_info), defocus,
++		 exp_af_last, isp4sd_exp_af_clamp(exp_af_last + step));
++	return isp4sd_exp_af_clamp(exp_af_last + step);
+ }
+ 
+ static void isp4sd_exp_af_cancel(void)
+@@ -781,6 +831,15 @@
+ 	d = isp4sd_exp_3a_buf(meta_info, &idx);
+ 	if (!d)
+ 		return;
++	if (af_drive == 2) {				/* patch 0052 */
++		pos = isp4sd_exp_af_servo(dev, meta_info, d);
++		if (pos < 0 || pos == exp_af_last)
++			return;
++		exp_af_last = pos;
++		xchg(&exp_af_pending, pos);
++		schedule_work(&exp_af_work);
++		return;
++	}
+ 	alg = get_unaligned_le32(d + 0x110);
+ 	real = isp4sd_exp_af_alg_to_real(alg);		/* patch 0051 */
+ 	pos = isp4sd_exp_af_real_to_code(real);
+@@ -938,6 +997,7 @@
+ 		exp_meta_data_next = 0;		/* patch 0034: round-robin re-send starts at the first buffer */
+ 		exp_af_meta_frames = 0;		/* patch 0049: log the first frames of every stream */
+ 		exp_af_last = -1;		/* patch 0050: first AF target of the stream is always written */
++		exp_af_frames = 0;		/* patch 0052: servo frame count restarts */
+ 		memset(&buf_type, 0, sizeof(buf_type));
+ 	}
+ 

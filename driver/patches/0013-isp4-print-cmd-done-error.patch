@@ -1,0 +1,14 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -407,6 +407,11 @@
+ 		para->cmd_id, para->cmd_status, para->cmd_seq_num,
+ 		ele);
+ 
++	/* EXPERIMENT (GZ302): always show the firmware's verdict, error code and 36-byte payload */
++	dev_info(dev, "EXP-RESP: seq %u cmd 0x%08x status %u (0 ok, 1 fail, 2 skipped) fw_error_code 0x%04x payload %36ph\n",
++		 para->cmd_seq_num, para->cmd_id, para->cmd_status,
++		 para->isp4fw_error_code, para->payload);
++
+ 	if (ele) {
+ 		complete(&ele->cmd_done);
+ 		if (atomic_dec_and_test(&ele->refcnt))

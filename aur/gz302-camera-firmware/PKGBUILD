@@ -1,0 +1,142 @@
+# Maintainer: Seifelden Abdelmonem <saif.elden.hatim@gmail.com>
+#
+# Firmware and data files for the rear camera (OmniVision OV13B10) of the ASUS ROG Flow Z13 2025
+# (GZ302EA), used by the camera drivers in gz302-camera-dkms.
+#
+# Nothing from the Windows camera driver is shipped here. You copy five files from your own
+# Windows install into ~/cam-firm-gz302ea/ (the folder name and the file names are matched
+# case-insensitively), and this package builds everything on your machine:
+#
+#   from C:\Windows\System32\DriverStore\FileRepository\sensorov13b.inf_amd64_*\
+#       OV13B_3001_ROG_SRX.atb             sensor tuning file (installed as is)
+#       asm_OV13B.asm                      sensor script source (assembled into gz302-ov13b-script.bin
+#                                          by the script assembler inside amdcamera.sys)
+#       sensorOV13B.sys                    sensor plugin (gives gz302-ov13b-sensor-prop.bin)
+#   from C:\Windows\System32\DriverStore\FileRepository\amdcamera.inf_amd64_*\
+#       srx_h_isp_firmware_signed.ram      ISP firmware (wrapped in the Linux isp_4_1_1.bin header)
+#       amdcamera.sys                      camera driver (gives gz302-ov13b-phy-seq.bin and assembles the script)
+#
+# The two .sys files are not installed: tools/gen_script.py, tools/gen_phy_seq.py and
+# tools/gen_sensor_prop.py run single functions of them in a CPU emulator (python-unicorn) on your
+# machine to produce the sensor script, the MIPI D-PHY receiver register sequence and the sensor
+# properties. Only the build tools come from the project.
+# Without the folder or with a file missing, prepare() stops and says what to copy.
+
+pkgname=gz302-camera-firmware
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Rear camera firmware for the ASUS ROG Flow Z13 GZ302, built from your own Windows driver files"
+arch=('any')
+url="https://github.com/Terminus-star/asus-gz302-ov13b10-isp4"
+license=('GPL-2.0-only')	# the build tools; the files you copy from Windows stay under their owners' terms
+makedepends=('python' 'python-unicorn' 'zstd' 'linux-firmware-amdgpu')
+options=('!debug' '!strip')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+b2sums=('SKIP')
+
+_userdir=cam-firm-gz302ea
+# The files this was tested with (driver on the GZ302EA in 2026-10). Other versions only give a warning
+# (the two generators also check the functions they run and refuse a driver version they cannot use).
+_files=(OV13B_3001_ROG_SRX.atb asm_OV13B.asm srx_h_isp_firmware_signed.ram amdcamera.sys sensorOV13B.sys)
+_tested_sha256=(
+	6b5cc5f8d60024d8d1c7545b20290de25071f24f797d79b508b286cf37df4b42
+	ab35d6bac0910b71f1fb717425d79c949c30ea58bd7218c6bf492296b47f9903
+	0bdfb088111618da600813fae31174bda22ce3680851f7173e6aeff611e4ae56
+	2376fd793af49fdd1e7d51607cbcaefc1d9d823fcb645c5be7f6d2d25b054263
+	53403d7def9f06dac4fbb10c212904b8c5965ded3dbc26879f02456511c8f5ef
+)
+
+# Entries named NAME (any upper/lower case) directly inside DIR, of find type TYPE (d or f).
+_find_ci() {
+	find "$1" -mindepth 1 -maxdepth 1 -type "$3" -iname "$2" 2>/dev/null
+}
+
+_howto() {
+	error "The GZ302 camera needs five files from your Windows install in ~/$_userdir/"
+	plain "  (folder and file names are matched case-insensitively; scripts/copy-windows-files.sh does it)"
+	plain ""
+	# plain() is printf-based: each \\ below prints one backslash.
+	plain '  From C:\\Windows\\System32\\DriverStore\\FileRepository\\sensorov13b.inf_amd64_*\\'
+	plain "      OV13B_3001_ROG_SRX.atb"
+	plain "      asm_OV13B.asm"
+	plain "      sensorOV13B.sys"
+	plain '  From C:\\Windows\\System32\\DriverStore\\FileRepository\\amdcamera.inf_amd64_*\\'
+	plain "      srx_h_isp_firmware_signed.ram"
+	plain "      amdcamera.sys"
+	plain ""
+	plain "  Copy them there and build again. Nothing is installed until they are present."
+}
+
+prepare() {
+	local -a dirs found
+	local dir i f missing=0
+
+	mapfile -t dirs < <(_find_ci "$HOME" "$_userdir" d)
+	if (( ${#dirs[@]} == 0 )); then
+		_howto
+		return 1
+	fi
+	if (( ${#dirs[@]} > 1 )); then
+		error "More than one ~/$_userdir folder (different upper/lower case): ${dirs[*]}"
+		plain "  Keep only one and build again."
+		return 1
+	fi
+	dir=${dirs[0]}
+	msg2 "Using $dir"
+
+	# Copy each file under its canonical name, so the tools below always find it.
+	mkdir -p "$srcdir/win"
+	for i in "${!_files[@]}"; do
+		f=${_files[$i]}
+		mapfile -t found < <(_find_ci "$dir" "$f" f)
+		if (( ${#found[@]} != 1 )); then
+			error "$f: ${#found[@]} matching files in $dir (need exactly one)"
+			missing=1
+			continue
+		fi
+		cp -- "${found[0]}" "$srcdir/win/$f"
+		if [[ $(sha256sum < "$srcdir/win/$f" | cut -d' ' -f1) == "${_tested_sha256[$i]}" ]]; then
+			msg2 "$f: same version as tested"
+		else
+			warning "$f: a different version from the one this was tested with; it may still work"
+		fi
+	done
+	if (( missing )); then
+		_howto
+		return 1
+	fi
+}
+
+build() {
+	local stock=/usr/lib/firmware/amdgpu/isp_4_1_1.bin.zst out
+	local -a src
+	[[ -e $stock ]] || stock=${stock%.zst}
+	# the tarball's top folder is named after the repository (<repo>-<version>)
+	src=("$srcdir"/*-"$pkgver")
+	cd "${src[0]}"
+	mkdir -p "$srcdir/out"
+
+	# The emulator module (python-unicorn) belongs to the system Python; call it by path, because a Python
+	# earlier in PATH (e.g. one installed by uv) would not have it.
+	/usr/bin/python3 -I tools/gen_script.py "$srcdir/win/amdcamera.sys" "$srcdir/win/asm_OV13B.asm" \
+		"$srcdir/out/gz302-ov13b-script.bin"
+	/usr/bin/python3 -I tools/gen_phy_seq.py "$srcdir/win/amdcamera.sys" "$srcdir/out/gz302-ov13b-phy-seq.bin"
+	/usr/bin/python3 -I tools/gen_sensor_prop.py "$srcdir/win/sensorOV13B.sys" "$srcdir/out/gz302-ov13b-sensor-prop.bin"
+
+	# build_winfw.py wants an output folder that does not exist yet: a fresh one per build.
+	out=$(mktemp -d -p "$srcdir" isp.XXXXXX)
+	python -I tools/build_winfw.py --linux-fw "$stock" --windows-dir "$srcdir/win" \
+		--out-dir "$out/img" --tag srx_h
+	cp "$out/img/isp_4_1_1_srx_h.bin" "$srcdir/out/isp_4_1_1.bin"
+}
+
+package() {
+	local fw="$pkgdir/usr/lib/firmware"
+	# updates/ is searched before the stock linux-firmware image, by the kernel and by mkinitcpio.
+	install -Dm644 "$srcdir/out/isp_4_1_1.bin" "$fw/updates/amdgpu/isp_4_1_1.bin"
+	# Loaded by the camera driver: request_firmware(amdgpu/...) and the tuning file by its full path.
+	install -Dm644 "$srcdir/out/gz302-ov13b-script.bin" "$fw/amdgpu/gz302-ov13b-script.bin"
+	install -Dm644 "$srcdir/out/gz302-ov13b-phy-seq.bin" "$fw/amdgpu/gz302-ov13b-phy-seq.bin"
+	install -Dm644 "$srcdir/out/gz302-ov13b-sensor-prop.bin" "$fw/amdgpu/gz302-ov13b-sensor-prop.bin"
+	install -Dm644 "$srcdir/win/OV13B_3001_ROG_SRX.atb" "$fw/amdgpu/OV13B_3001_ROG_SRX.atb"
+}

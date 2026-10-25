@@ -1,0 +1,116 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -68,6 +68,20 @@
+ MODULE_PARM_DESC(skip_enable_gpio,
+ 		 "EXPERIMENT: never drive the enable_isp GPIO (AMDI0030:00 pin 85); it stays low");
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0025): the Windows init table programs the OV13B PLL as 0x0303=0x01, 0x0305=0x46,
++ * 0x0325=0x55, which gives 1120 Mbps/lane only from a 24 MHz input clock; the Linux driver programs 0x04/0xaf/0xa4,
++ * which gives 1120 Mbps only from 19.2 MHz (findings section 58).  The ISP firmware and the D-PHY are set up for
++ * 1120 Mbps, and the receiver sees corrupt packet headers.  After a successful s_stream(1):
++ *   sensor_pll=1  read the live PLL/MIPI registers back over raw I2C and log them (no writes)
++ *   sensor_pll=2  read back, then in software standby (0x0100=0) write the Windows PLL values, stream on again
++ *                 (0x0100=1), and read back again
++ */
++static unsigned int sensor_pll;
++module_param(sensor_pll, uint, 0444);
++MODULE_PARM_DESC(sensor_pll,
++		 "EXPERIMENT: after ov13b10 s_stream: 1 log the PLL registers, 2 also apply the Windows (24 MHz) PLL values");
++
+ static struct device *exp_sensor_dev;		/* reference held while the sensor streams */
+ static struct v4l2_subdev *exp_sensor_sd;
+ 
+@@ -100,6 +114,79 @@
+ 		 pm_runtime_active(&client->dev));
+ }
+ 
++/* patch 0025: one 8-bit register of the sensor over raw I2C (16-bit big-endian register address) */
++static int isp4sd_exp_rd8(struct i2c_client *client, u16 reg, u8 *val)
++{
++	u8 addr[2] = { reg >> 8, reg & 0xff };
++	struct i2c_msg msg[2] = {
++		{ .addr = client->addr, .flags = 0, .len = sizeof(addr), .buf = addr },
++		{ .addr = client->addr, .flags = I2C_M_RD, .len = 1, .buf = val },
++	};
++	int ret = i2c_transfer(client->adapter, msg, 2);
++
++	return ret == 2 ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++static int isp4sd_exp_wr8(struct i2c_client *client, u16 reg, u8 val)
++{
++	u8 buf[3] = { reg >> 8, reg & 0xff, val };
++	struct i2c_msg msg = { .addr = client->addr, .flags = 0, .len = sizeof(buf), .buf = buf };
++	int ret = i2c_transfer(client->adapter, &msg, 1);
++
++	return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++/* PLL, stream and MIPI timing registers that differ or matter between the Windows and Linux tables */
++static const u16 exp_pll_regs[] = {
++	0x0100, 0x0303, 0x0305, 0x0321, 0x0323, 0x0324, 0x0325, 0x0326, 0x0327, 0x3011, 0x4800, 0x4837,
++};
++
++static void isp4sd_exp_pll_dump(struct device *dev, struct i2c_client *client, const char *when)
++{
++	char line[256];
++	int n = 0;
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(exp_pll_regs); i++) {
++		u8 v = 0;
++		int r = isp4sd_exp_rd8(client, exp_pll_regs[i], &v);
++
++		if (r)
++			n += scnprintf(line + n, sizeof(line) - n, " 0x%04x=ERR%d", exp_pll_regs[i], r);
++		else
++			n += scnprintf(line + n, sizeof(line) - n, " 0x%04x=%02x", exp_pll_regs[i], v);
++	}
++	dev_info(dev, "EXP-SENSOR: PLL regs (%s):%s\n", when, line);
++}
++
++/*
++ * Windows PLL values (findings section 3 table, section 58).  Software standby first: an OmniVision sensor
++ * should not change its PLL while streaming.  Returns the first I2C error or 0.
++ */
++static int isp4sd_exp_pll_apply_windows(struct device *dev, struct i2c_client *client)
++{
++	static const struct { u16 reg; u8 val; } seq[] = {
++		{ 0x0100, 0x00 },	/* software standby */
++		{ 0x0303, 0x01 },
++		{ 0x0305, 0x46 },
++		{ 0x0325, 0x55 },
++	};
++	int ret;
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(seq); i++) {
++		ret = isp4sd_exp_wr8(client, seq[i].reg, seq[i].val);
++		if (ret) {
++			dev_err(dev, "EXP-SENSOR: PLL write 0x%04x=0x%02x failed: %d\n", seq[i].reg, seq[i].val, ret);
++			return ret;
++		}
++		if (i == 0)
++			usleep_range(5000, 6000);	/* let the current frame end before touching the PLL */
++	}
++	usleep_range(5000, 6000);		/* PLL lock */
++	ret = isp4sd_exp_wr8(client, 0x0100, 0x01);	/* stream on */
++	dev_info(dev, "EXP-SENSOR: applied the Windows PLL values (0x0303=01 0x0305=46 0x0325=55), stream on -> %d\n", ret);
++	return ret;
++}
++
+ static void isp4sd_exp_sensor_start(struct device *dev, struct isp4_interface *ispif, const char *when)
+ {
+ 	struct device *sdev;
+@@ -152,6 +239,12 @@
+ 
+ 	ret = v4l2_subdev_call(sd, video, s_stream, 1);
+ 	dev_info(dev, "EXP-SENSOR: %s s_stream(1) %s START_STREAM -> %d\n", sd->name, when, ret);
++	if (!ret && sensor_pll) {
++		/* patch 0025: what the sensor really got, and optionally the Windows PLL values */
++		isp4sd_exp_pll_dump(dev, client, "after s_stream");
++		if (sensor_pll >= 2 && !isp4sd_exp_pll_apply_windows(dev, client))
++			isp4sd_exp_pll_dump(dev, client, "after Windows PLL");
++	}
+ 	if (!ret && isp4if_phy_init_enabled()) {
+ 		/* patch 0022: D-PHY state right after, 100 ms and 1 s after the sensor started streaming */
+ 		isp4if_phy_diag(ispif, "after s_stream");

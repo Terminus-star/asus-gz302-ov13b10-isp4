@@ -1,0 +1,71 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -1085,6 +1085,40 @@
+ }
+ 
+ /*
++ * EXPERIMENT (GZ302, patch 0022): read-only snapshot of the D-PHY receiver state, to tell "the sensor is not
++ * transmitting" (data lanes stay in the LP-11 stop state) from "the sensor transmits but the receiver cannot decode it"
++ * (lanes leave stop state).  Logs the 13 direct dwords of the PHY controller (0x66700-0x66730), the global PHY reset
++ * and the lane stop-state.  Only reads; but the status registers may be clear-on-read, so a snapshot can clear a
++ * latched bit (observer effect).  Same separate ioremap window as isp4if_phy_init().  Needs phy_init=1.
++ */
++void isp4if_phy_diag(struct isp4_interface *ispif, const char *label)
++{
++	struct device *dev = ispif->dev;
++	struct resource *res;
++	void __iomem *w;
++	u32 stop;
++	unsigned int i;
++
++	if (!phy_init)
++		return;
++
++	res = platform_get_resource(to_platform_device(dev), IORESOURCE_MEM, 0);
++	if (!res)
++		return;
++	w = ioremap(res->start + EXP_PHY_WIN, EXP_PHY_WIN_SIZE);
++	if (!w)
++		return;
++
++	isp4hw_wreg(ispif->mmio, EXP_IND_INDEX, EXP_PHY_STOPSTATE);
++	stop = isp4hw_rreg(ispif->mmio, EXP_IND_DATA);
++	dev_info(dev, "EXP-PHYDIAG[%s]: global reset 0x%08x, lane stop-state 0x%08x (bits 15:8 = 0x%02x)\n", label,
++		 phy_rd32(w, EXP_PHY_GLOBAL_RESET), stop, (stop >> 8) & 0xff);
++	for (i = 0; i <= 0x30; i += 4)
++		dev_info(dev, "EXP-PHYDIAG[%s]: +0x%02x = 0x%08x\n", label, i, phy_rd32(w, EXP_PHY_BASE + i));
++	iounmap(w);
++}
++
++/*
+  * SET_TUNING_DATA (0x02050008), decoded from amdcamera.sys (findings section 28).  The firmware
+  * log says "Host setfile buf queue empty" / "RTA setfile buf empty" and fails START_STREAM
+  * (error 0x27) because the host never delivers the sensor tuning file.  Windows copies the file
+--- a/drivers/media/platform/amd/isp4/isp4_interface.h
++++ b/drivers/media/platform/amd/isp4/isp4_interface.h
+@@ -118,6 +118,8 @@
+ /* EXPERIMENT (GZ302 bring-up): host-side MIPI D-PHY receiver start like Windows, no-op unless phy_init=1 */
+ bool isp4if_phy_init_enabled(void);
+ int isp4if_phy_init(struct isp4_interface *ispif);
++/* EXPERIMENT (patch 0022): read-only D-PHY state snapshot, no-op unless phy_init=1 */
++void isp4if_phy_diag(struct isp4_interface *ispif, const char *label);
+ 
+ /* EXPERIMENT (GZ302 bring-up): replay of the Windows sensor setup, no-op unless replay_sensor_setup=1 */
+ int isp4if_replay_sensor_setup(struct isp4_interface *ispif);
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -140,6 +140,14 @@
+ 
+ 	ret = v4l2_subdev_call(sd, video, s_stream, 1);
+ 	dev_info(dev, "EXP-SENSOR: %s s_stream(1) %s START_STREAM -> %d\n", sd->name, when, ret);
++	if (!ret && isp4if_phy_init_enabled()) {
++		/* patch 0022: D-PHY state right after, 100 ms and 1 s after the sensor started streaming */
++		isp4if_phy_diag(ispif, "after s_stream");
++		msleep(100);
++		isp4if_phy_diag(ispif, "+100ms");
++		msleep(900);
++		isp4if_phy_diag(ispif, "+1s");
++	}
+ 	if (pm_ref >= 0)
+ 		pm_runtime_put(&client->dev);
+ 	if (ret) {

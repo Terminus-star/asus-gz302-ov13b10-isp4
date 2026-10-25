@@ -1,0 +1,44 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -252,6 +252,32 @@
+ 		 EXP_VCM_I2C_ADDR, when, vcm_init, r1, park, r2);
+ }
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0042): move the lens from the host, bypassing the firmware, to find out
++ * whether the motor itself works (findings 109). Right after s_stream(1) succeeds the host writes one
++ * position frame in the format of the Windows init (mode 1): {pos >> 4 & 0x3f, (pos & 0xf) << 4 | 0x04},
++ * e.g. 400 -> 19 04, 1023 -> 3F F4, 0 -> 00 04. -1 (default) = off.
++ */
++static int vcm_test_pos = -1;
++module_param(vcm_test_pos, int, 0444);
++MODULE_PARM_DESC(vcm_test_pos,
++		 "EXPERIMENT: after s_stream(1), write this lens position 0..1023 to the motor at I2C 0x0c from the host (mode-1 frame); -1 = off");
++
++static void isp4sd_exp_vcm_test(struct device *dev, struct i2c_client *client)
++{
++	unsigned int pos;
++	u8 b1, b2;
++	int ret;
++
++	if (vcm_test_pos < 0)
++		return;
++	pos = min(vcm_test_pos, 1023);
++	b1 = (pos >> 4) & 0x3f;
++	b2 = ((pos & 0xf) << 4) | 0x04;
++	ret = isp4sd_exp_vcm_wr(client, b1, b2);
++	dev_info(dev, "EXP-VCM: host test write, position %u: %02X %02X -> %d\n", pos, b1, b2, ret);
++}
++
+ /* PLL, stream and MIPI timing registers that differ or matter between the Windows and Linux tables */
+ static const u16 exp_pll_regs[] = {
+ 	0x0100, 0x0303, 0x0305, 0x0321, 0x0323, 0x0324, 0x0325, 0x0326, 0x0327, 0x3011, 0x4800, 0x4837,
+@@ -424,6 +450,8 @@
+ 	/* patch 0040: without the PHY start's PM reference, init the motor once the sensor is powered by s_stream */
+ 	if (!ret && pm_ref < 0)
+ 		isp4sd_exp_vcm_init(dev, client, "after s_stream");
++	if (!ret)
++		isp4sd_exp_vcm_test(dev, client);	/* patch 0042 */
+ 	if (!ret && sensor_pll) {
+ 		/* patch 0025: what the sensor really got, and optionally the Windows PLL values */
+ 		isp4sd_exp_pll_dump(dev, client, "after s_stream");

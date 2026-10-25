@@ -1,0 +1,87 @@
+--- a/drivers/media/platform/amd/isp4/isp4.c
++++ b/drivers/media/platform/amd/isp4/isp4.c
+@@ -3,6 +3,8 @@
+  * Copyright (C) 2025 Advanced Micro Devices, Inc.
+  */
+ 
++#include <linux/dmi.h>
++#include <linux/gpio/machine.h>
+ #include <linux/irq.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/vmalloc.h>
+@@ -229,7 +231,57 @@
+ 	}
+ };
+ 
+-module_platform_driver(isp4_capture_drv);
++/*
++ * EXPERIMENT (GZ302, patch 0053): no-custom-kernel route (findings 136). amdgpu registers the "enable_isp" GPIO
++ * lookup only for the HP sensor (HID OMNI5C10); our kernel patch 0003 added it for the GZ302. Without that kernel
++ * patch the capture driver registers the same lookup itself (AMDI0030:00 pin 85, as 0003), on the GZ302 only,
++ * before its driver is registered, so the order against amdgpu does not matter. The GPIO is also optional now
++ * (isp4_subdev.c): the ISP works with the line undriven (findings 53).
++ */
++static struct gpiod_lookup_table isp4_gz302_gpio_table = {
++	.dev_id = ISP4_DRV_NAME,
++	.table = {
++		GPIO_LOOKUP("AMDI0030:00", 85, "enable_isp", GPIO_ACTIVE_HIGH),
++		{ }
++	},
++};
++
++static const struct dmi_system_id isp4_gz302_dmi[] = {
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
++			DMI_MATCH(DMI_BOARD_NAME, "GZ302"),
++		},
++	},
++	{ }
++};
++
++static bool isp4_gz302_gpio_added;
++
++static int __init isp4_capture_init(void)
++{
++	int ret;
++
++	if (dmi_check_system(isp4_gz302_dmi)) {
++		gpiod_add_lookup_table(&isp4_gz302_gpio_table);
++		isp4_gz302_gpio_added = true;
++	}
++	ret = platform_driver_register(&isp4_capture_drv);
++	if (ret && isp4_gz302_gpio_added) {
++		gpiod_remove_lookup_table(&isp4_gz302_gpio_table);
++		isp4_gz302_gpio_added = false;
++	}
++	return ret;
++}
++module_init(isp4_capture_init);
++
++static void __exit isp4_capture_exit(void)
++{
++	platform_driver_unregister(&isp4_capture_drv);
++	if (isp4_gz302_gpio_added)
++		gpiod_remove_lookup_table(&isp4_gz302_gpio_table);
++}
++module_exit(isp4_capture_exit);
+ 
+ MODULE_ALIAS("platform:" ISP4_DRV_NAME);
+ MODULE_IMPORT_NS("DMA_BUF");
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -2141,10 +2141,10 @@
+ 	mutex_init(&isp_subdev->ops_mutex);
+ 	sensor_info->status = ISP4SD_START_STATUS_OFF;
+ 
+-	/* create ISP enable gpio control */
+-	isp_subdev->enable_gpio = devm_gpiod_get(isp_subdev->dev,
+-						 "enable_isp",
+-						 GPIOD_OUT_LOW);
++	/* create ISP enable gpio control; patch 0053: optional (no lookup without the amdgpu board patch) */
++	isp_subdev->enable_gpio = devm_gpiod_get_optional(isp_subdev->dev,
++							  "enable_isp",
++							  GPIOD_OUT_LOW);
+ 	if (IS_ERR(isp_subdev->enable_gpio)) {
+ 		ret = PTR_ERR(isp_subdev->enable_gpio);
+ 		dev_err(dev, "fail to get gpiod %d\n", ret);

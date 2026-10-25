@@ -1,0 +1,72 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -187,6 +187,33 @@
+ 	return ret;
+ }
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0026): safety limit for live tests.  With the Windows PLL the CSI-2 data decodes, the
++ * ISP's MIPI write DMA overflows (INTR_LATENCY_BUFFER_LEAKING, ~110 ms after START_STREAM) and ~2 s later the ISP
++ * firmware and the SMU hang, freezing the machine (findings sections 59/60).  With sensor_burst_ms=N the sensor is
++ * put into software standby (0x0100=0, raw I2C) N ms after it started streaming, so the data flood ends early.
++ * Use it with start_sensor=1 (sensor started after START_STREAM is queued): with start_sensor=2 and phy_init the
++ * sensor starts ~1.1 s before START_STREAM and the burst would end before the pipeline runs.
++ */
++static unsigned int sensor_burst_ms;
++module_param(sensor_burst_ms, uint, 0444);
++MODULE_PARM_DESC(sensor_burst_ms,
++		 "EXPERIMENT: put the sensor into software standby N ms after it started streaming (0 = off; use with start_sensor=1)");
++
++static struct i2c_client *exp_burst_client;	/* sensor to stop, set while the work is armed */
++static struct device *exp_burst_log_dev;
++
++static void isp4sd_exp_burst_fn(struct work_struct *work)
++{
++	int ret = exp_burst_client ? isp4sd_exp_wr8(exp_burst_client, 0x0100, 0x00) : -ENODEV;
++
++	if (exp_burst_log_dev)
++		dev_info(exp_burst_log_dev, "EXP-SENSOR: burst limit: sensor put into software standby after %u ms -> %d\n",
++			 sensor_burst_ms, ret);
++}
++
++static DECLARE_DELAYED_WORK(exp_burst_work, isp4sd_exp_burst_fn);
++
+ static void isp4sd_exp_sensor_start(struct device *dev, struct isp4_interface *ispif, const char *when)
+ {
+ 	struct device *sdev;
+@@ -245,6 +272,13 @@
+ 		if (sensor_pll >= 2 && !isp4sd_exp_pll_apply_windows(dev, client))
+ 			isp4sd_exp_pll_dump(dev, client, "after Windows PLL");
+ 	}
++	if (!ret && sensor_burst_ms) {
++		/* patch 0026: end the sensor's output after a short burst (runs from a workqueue) */
++		exp_burst_client = client;
++		exp_burst_log_dev = dev;
++		schedule_delayed_work(&exp_burst_work, msecs_to_jiffies(sensor_burst_ms));
++		dev_info(dev, "EXP-SENSOR: burst limit armed: sensor standby in %u ms\n", sensor_burst_ms);
++	}
+ 	if (!ret && isp4if_phy_init_enabled()) {
+ 		/* patch 0022: D-PHY state right after, 100 ms and 1 s after the sensor started streaming */
+ 		isp4if_phy_diag(ispif, "after s_stream");
+@@ -269,6 +303,10 @@
+ {
+ 	int ret;
+ 
++	/* patch 0026: the burst work must not run on a sensor that is being stopped */
++	cancel_delayed_work_sync(&exp_burst_work);
++	exp_burst_client = NULL;
++
+ 	if (!exp_sensor_dev)
+ 		return;
+ 
+@@ -1339,6 +1377,10 @@
+ {
+ 	struct isp4_interface *ispif = &isp_subdev->ispif;
+ 
++	/* patch 0026: never leave the burst work pending when the module goes away */
++	cancel_delayed_work_sync(&exp_burst_work);
++	exp_burst_client = NULL;
++
+ 	isp4vid_dev_deinit(&isp_subdev->isp_vdev);
+ 	v4l2_device_unregister_subdev(&isp_subdev->sdev);
+ 	media_entity_cleanup(&isp_subdev->sdev.entity);

@@ -1,0 +1,170 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -75,6 +75,8 @@
+ static struct isp4if_gpu_mem_info *exp_3a_mem;
+ /* EXPERIMENT (GZ302, patch 0044): SET_LOG_MODULE_LEVEL payload, see isp4if_send_log_levels() */
+ static struct isp4if_gpu_mem_info *exp_log_mem;
++/* EXPERIMENT (GZ302, patch 0045): data buffer of SEND_I2C_MSG, see isp4if_fw_i2c_write() */
++static struct isp4if_gpu_mem_info *exp_i2c_mem;
+ 
+ /*
+  * EXPERIMENT (GZ302): size of the firmware memory pool in MiB.  The stock driver sends 100 MiB
+@@ -270,6 +272,8 @@
+ 		isp4if_gpu_mem_free(ispif, &exp_3a_mem);
+ 	if (exp_log_mem)	/* patch 0044 */
+ 		isp4if_gpu_mem_free(ispif, &exp_log_mem);
++	if (exp_i2c_mem)	/* patch 0045 */
++		isp4if_gpu_mem_free(ispif, &exp_i2c_mem);
+ 
+ 	for (unsigned int i = 0; i < ISP4IF_MAX_STREAM_BUF_COUNT; i++)
+ 		isp4if_gpu_mem_free(ispif, &ispif->meta_info_buf[i]);
+@@ -1188,6 +1192,65 @@
+ }
+ 
+ /*
++ * EXPERIMENT (GZ302, patch 0045): an I2C write done BY THE FIRMWARE (CMD_ID_SEND_I2C_MSG 0x02090003,
++ * handler StreamCmdDevSendI2CMsg), so the host never touches the shared I2C controller while the
++ * firmware streams (host transfers then corrupt the sensor, findings 114). Layout from Windows'
++ * write sender (0x140002484, sync, 36 bytes, timeout 1 s; findings 116): controller 0, op 2 = write,
++ * restart 0, address type 1 = 7-bit, register type 1 = 8-bit, slave, register, length, first data
++ * byte, and the GPU address of a 4 KiB buffer that holds the data (Windows fills both).
++ * A 2-byte motor frame {b1, b2} is register b1 with data b2, length 1, like the script's WI2C.
++ */
++#define EXP_CMD_ID_SEND_I2C_MSG	0x02090003
++
++struct isp4if_exp_i2c_msg {
++	u32 device;		/* 0x00 ISP I2C controller index (0) */
++	u32 op;			/* 0x04 1 = read, 2 = write */
++	u32 restart;		/* 0x08 repeated start (write: 0) */
++	u32 addr_type;		/* 0x0c 1 = 7-bit address */
++	u32 reg_type;		/* 0x10 1 = 8-bit register, 2 = 16-bit */
++	u16 slave;		/* 0x14 7-bit I2C address */
++	u16 reg;		/* 0x16 register address */
++	u16 len;		/* 0x18 data bytes */
++	u8 data0;		/* 0x1a first data byte, inline */
++	u8 pad;			/* 0x1b */
++	u32 buf_lo;		/* 0x1c GPU address of the data buffer */
++	u32 buf_hi;		/* 0x20 */
++} __packed;
++
++int isp4if_fw_i2c_write(struct isp4_interface *ispif, u8 slave, u8 reg, u8 val)
++{
++	struct isp4if_exp_i2c_msg msg = {
++		.device = 0,
++		.op = 2,
++		.restart = 0,
++		.addr_type = 1,
++		.reg_type = 1,
++		.slave = slave,
++		.reg = reg,
++		.len = 1,
++		.data0 = val,
++	};
++	u32 lo, hi;
++	int ret;
++
++	BUILD_BUG_ON(sizeof(msg) != 0x24);
++	if (!exp_i2c_mem) {
++		exp_i2c_mem = isp4if_gpu_mem_alloc(ispif, SZ_4K);
++		if (!exp_i2c_mem)
++			return -ENOMEM;
++	}
++	memset(exp_i2c_mem->sys_addr, 0, exp_i2c_mem->mem_size);
++	*(u8 *)exp_i2c_mem->sys_addr = val;
++	isp4if_split_addr64(exp_i2c_mem->gpu_mc_addr, &lo, &hi);	/* no pointers into the packed struct */
++	msg.buf_lo = lo;
++	msg.buf_hi = hi;
++
++	ret = isp4if_send_command_sync(ispif, EXP_CMD_ID_SEND_I2C_MSG, &msg, sizeof(msg));
++	dev_dbg(ispif->dev, "EXP-FWI2C: write 0x%02x reg 0x%02x = 0x%02x -> %d\n", slave, reg, val, ret);
++	return ret;
++}
++
++/*
+  * SET_SENSOR_PROP was rejected with fw_error_code 0x1b (findings section 18).  Send altered copies
+  * of the payload and watch whether the code changes (EXP-RESP line): a different code means a
+  * different check failed.
+--- a/drivers/media/platform/amd/isp4/isp4_interface.h
++++ b/drivers/media/platform/amd/isp4/isp4_interface.h
+@@ -130,6 +130,9 @@
+ /* EXPERIMENT (GZ302, patch 0044): firmware log levels per module (SET_LOG_MODULE_LEVEL) */
+ void isp4if_send_log_levels(struct isp4_interface *ispif);
+ 
++/* EXPERIMENT (GZ302, patch 0045): 8-bit-register I2C write performed by the firmware (SEND_I2C_MSG) */
++int isp4if_fw_i2c_write(struct isp4_interface *ispif, u8 slave, u8 reg, u8 val);
++
+ int isp4if_send_command(struct isp4_interface *ispif, u32 cmd_id,
+ 			const void *package, u32 package_size);
+ 
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -293,9 +293,20 @@
+ MODULE_PARM_DESC(focus_control,
+ 		 "EXPERIMENT: manual focus control (V4L2 focus_absolute 0..1023) written to the motor by the host; replaces vcm_init (default on)");
+ 
++/*
++ * patch 0045: while the firmware streams, the host must not use the shared I2C controller (it
++ * corrupts the sensor, findings 114); live focus changes then go through the firmware with
++ * SEND_I2C_MSG. 0 = old direct host write (unsafe while streaming, for comparison only).
++ */
++static bool focus_via_fw = true;
++module_param(focus_via_fw, bool, 0444);
++MODULE_PARM_DESC(focus_via_fw,
++		 "EXPERIMENT: live focus changes while streaming go through the firmware (SEND_I2C_MSG) instead of the host I2C controller (default on)");
++
+ static DEFINE_MUTEX(exp_focus_lock);
+ static u32 exp_focus_pos = ISP4SD_FOCUS_DEFAULT;
+ static struct i2c_client *exp_focus_client;
++static struct isp4_interface *exp_focus_ispif;	/* patch 0045 */
+ 
+ static int isp4sd_exp_focus_write(struct i2c_client *client, u32 pos)
+ {
+@@ -313,7 +324,16 @@
+ 
+ 	mutex_lock(&exp_focus_lock);
+ 	exp_focus_pos = clamp(pos, 0, ISP4SD_FOCUS_MAX);
+-	if (exp_focus_client) {
++	if (exp_focus_client && focus_via_fw && exp_focus_ispif) {
++		/* patch 0045: mode-1 frame {pos >> 4 & 0x3f, (pos & 0xf) << 4 | 4} as register + data */
++		ret = isp4if_fw_i2c_write(exp_focus_ispif, EXP_VCM_I2C_ADDR, (exp_focus_pos >> 4) & 0x3f,
++					  ((exp_focus_pos & 0xf) << 4) | 0x04);
++		if (ret)
++			dev_warn(&exp_focus_client->dev, "EXP-FOCUS: firmware I2C write of position %u failed: %d\n",
++				 exp_focus_pos, ret);
++		else
++			dev_dbg(&exp_focus_client->dev, "EXP-FOCUS: position %u via firmware\n", exp_focus_pos);
++	} else if (exp_focus_client) {
+ 		ret = isp4sd_exp_focus_write(exp_focus_client, exp_focus_pos);
+ 		dev_dbg(&exp_focus_client->dev, "EXP-FOCUS: position %u -> %d\n", exp_focus_pos, ret);
+ 	}
+@@ -338,10 +358,11 @@
+ }
+ 
+ /* from now on control changes go straight to the motor (NULL = sensor stopped) */
+-static void isp4sd_exp_focus_attach(struct i2c_client *client)
++static void isp4sd_exp_focus_attach(struct i2c_client *client, struct isp4_interface *ispif)
+ {
+ 	mutex_lock(&exp_focus_lock);
+ 	exp_focus_client = focus_control ? client : NULL;
++	exp_focus_ispif = exp_focus_client ? ispif : NULL;	/* patch 0045 */
+ 	mutex_unlock(&exp_focus_lock);
+ }
+ 
+@@ -520,7 +541,7 @@
+ 	if (!ret)
+ 		isp4sd_exp_vcm_test(dev, client);	/* patch 0042 */
+ 	if (!ret)
+-		isp4sd_exp_focus_attach(client);	/* patch 0043 */
++		isp4sd_exp_focus_attach(client, ispif);	/* patch 0043, 0045 */
+ 	if (!ret && sensor_pll) {
+ 		/* patch 0025: what the sensor really got, and optionally the Windows PLL values */
+ 		isp4sd_exp_pll_dump(dev, client, "after s_stream");
+@@ -565,7 +586,7 @@
+ 	if (!exp_sensor_dev)
+ 		return;
+ 
+-	isp4sd_exp_focus_attach(NULL);	/* patch 0043: no motor writes once the sensor stops */
++	isp4sd_exp_focus_attach(NULL, NULL);	/* patch 0043: no motor writes once the sensor stops */
+ 	ret = v4l2_subdev_call(exp_sensor_sd, video, s_stream, 0);
+ 	dev_info(dev, "EXP-SENSOR: %s s_stream(0) -> %d\n", exp_sensor_sd->name, ret);
+ 	put_device(exp_sensor_dev);

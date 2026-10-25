@@ -1,0 +1,156 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -25,12 +25,27 @@
+  * EXPERIMENT (GZ302): size of the firmware memory pool in MiB.  The stock driver sends 100 MiB
+  * (ISP4FW_MEMORY_POOL_SIZE, sized for the OV05C10); the Windows driver allocates 200 MiB
+  * (findings section 30) and the firmware runs out of internal buffers for the 13 MP OV13B mode with 100.
+- * 0 = keep the stock size.
++ * Patch 0035: 0 (default) = computed like Windows' allocate_fw_mempool_imp from the sensor pixel count
++ * (findings section 75), 275,054,592 bytes for 4208 x 3120; any other value = that many MiB.
+  */
+ static unsigned int fw_mem_pool_mb;
+ module_param(fw_mem_pool_mb, uint, 0444);
+ MODULE_PARM_DESC(fw_mem_pool_mb,
+-		 "EXPERIMENT: firmware memory pool size in MiB (0 = stock 100 MiB, Windows uses 200)");
++		 "EXPERIMENT: firmware memory pool size in MiB (0 = computed like Windows for the OV13B, 262.3 MiB)");
++
++#define EXP_SENSOR_PIXELS	(4208 * 3120)	/* OV13B mode 0, the only mode used */
++
++/* Windows' pool-size formula (amdcamera.sys allocate_fw_mempool_imp, flag 0), w = sensor pixel count */
++static u64 isp4if_exp_pool_size(u32 w)
++{
++	u32 a = (2 * w + 0x7ffe) & 0xffff8000;
++	u32 h = w >> 1;
++	u32 b = ((h + 0x7fff) & 0xffff8000) + 0x798000;
++	u32 c = (6 * w + 0x1fffc) & 0xfffe0000;
++	u32 d = (h + 0x1fffc) & 0xfffe0000;
++
++	return 5ULL * a + 4ULL * b + c + d;
++}
+ 
+ #define ISP4IF_FW_RESP_RB_IRQ_EN_MASK \
+ 	(ISP_SYS_INT0_EN__SYS_INT_RINGBUFFER_WPT9_EN_MASK\
+@@ -205,10 +220,11 @@
+ {
+ 	struct device *dev = ispif->dev;
+ 
+-	u64 pool_size = fw_mem_pool_mb ? (u64)fw_mem_pool_mb * SZ_1M : ISP4FW_MEMORY_POOL_SIZE;
++	u64 pool_size = fw_mem_pool_mb ? (u64)fw_mem_pool_mb * SZ_1M :
++					 isp4if_exp_pool_size(EXP_SENSOR_PIXELS);
+ 
+ 	dev_info(dev, "EXP: firmware memory pool %llu bytes (%s)\n", pool_size,
+-		 fw_mem_pool_mb ? "fw_mem_pool_mb" : "stock");
++		 fw_mem_pool_mb ? "fw_mem_pool_mb" : "computed like Windows");
+ 	ispif->fw_mem_pool = isp4if_gpu_mem_alloc(ispif, pool_size);
+ 	if (!ispif->fw_mem_pool)
+ 		goto error_no_memory;
+@@ -845,7 +861,7 @@
+ #define EXP_CMD_ID_SET_SENSOR_PROP	0x02090001
+ #define EXP_CMD_ID_SET_DEVICE_SCRIPT	0x02090002
+ 
+-static bool replay_sensor_setup;
++static bool replay_sensor_setup = true;	/* patch 0035: default on */
+ module_param(replay_sensor_setup, bool, 0644);
+ MODULE_PARM_DESC(replay_sensor_setup,
+ 		 "EXPERIMENT: send the Windows sensor setup (script + sensor properties) before SET_STREAM_CONFIG");
+@@ -866,7 +882,7 @@
+ #define EXP_SCRIPT_I2C_DESC_OFF	0x169c
+ #define EXP_SCRIPT_I2C_DESC_SIZE	0x14
+ 
+-static unsigned int script_i2c;
++static unsigned int script_i2c = 2;	/* patch 0035: sensor + focus motor */
+ module_param(script_i2c, uint, 0444);
+ MODULE_PARM_DESC(script_i2c,
+ 		 "EXPERIMENT: fill the SET_DEVICE_SCRIPT I2C descriptors: 0 off, 1 sensor, 2 sensor + focus motor, 3 all four = sensor");
+@@ -1039,7 +1055,7 @@
+ #define EXP_IND_INDEX		0x61f08
+ #define EXP_IND_DATA		0x61f0c
+ 
+-static bool phy_init;
++static bool phy_init = true;	/* patch 0035: default on */
+ module_param(phy_init, bool, 0444);
+ MODULE_PARM_DESC(phy_init,
+ 		 "EXPERIMENT: start the MIPI D-PHY receiver from the host like Windows (needs start_sensor)");
+@@ -1223,7 +1239,7 @@
+ #define EXP_TUNING_BUF_TYPE		14
+ #define EXP_TUNING_AREA			0x300000	/* Windows' buffer size for the first blob */
+ 
+-static char *tuning_file;
++static char *tuning_file = "/lib/firmware/amdgpu/OV13B_3001_ROG_SRX.atb";	/* patch 0035 */
+ module_param(tuning_file, charp, 0444);
+ MODULE_PARM_DESC(tuning_file,
+ 		 "EXPERIMENT: path of the sensor tuning file (OV13B_3001_ROG_SRX.atb) to send with SET_TUNING_DATA; needs replay_sensor_setup=1");
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -38,7 +38,7 @@
+  */
+ #define EXP_SENSOR_I2C_NAME "i2c-ov13b10"
+ 
+-static unsigned int start_sensor;
++static unsigned int start_sensor = 1;	/* patch 0035: default 1 */
+ module_param(start_sensor, uint, 0444);
+ MODULE_PARM_DESC(start_sensor,
+ 		 "EXPERIMENT: start the OV13B via ov13b10 s_stream: 0 off, 1 after START_STREAM is queued, 2 before");
+@@ -51,7 +51,7 @@
+  * runtime suspend and resume once the ISP is up (power_off then power_on of the driver: the reset GPIO is
+  * asserted and released again), before the raw I2C probe and s_stream.  Needs start_sensor != 0.
+  */
+-static bool sensor_pm_cycle;
++static bool sensor_pm_cycle = true;	/* patch 0035: default on */
+ module_param(sensor_pm_cycle, bool, 0444);
+ MODULE_PARM_DESC(sensor_pm_cycle,
+ 		 "EXPERIMENT: force an ov13b10 runtime suspend+resume (re-drives its enable GPIO) before starting it; needs start_sensor");
+@@ -80,7 +80,7 @@
+  *                 Linux ov13b10 one (findings section 59): above all 0x3813=0x08 (vertical window offset; Linux
+  *                 0x09 shifts the Bayer pattern by one row, suspected cause of the magenta cast, section 88)
+  */
+-static unsigned int sensor_pll;
++static unsigned int sensor_pll = 3;	/* patch 0035: Windows PLL + mode registers */
+ module_param(sensor_pll, uint, 0444);
+ MODULE_PARM_DESC(sensor_pll,
+ 		 "EXPERIMENT: after ov13b10 s_stream: 1 log the PLL registers, 2 also apply the Windows (24 MHz) PLL values, 3 also the other Windows mode registers (0x3813=08 ...)");
+@@ -115,7 +115,7 @@
+ #define EXP_WIN_ITIME_RANGE	0x20
+ #define EXP_WIN_PREFETCH	0x40
+ 
+-static unsigned int win_cmds;
++static unsigned int win_cmds = 0x77;	/* patch 0035: all but scene mode */
+ module_param(win_cmds, uint, 0444);
+ MODULE_PARM_DESC(win_cmds,
+ 		 "EXPERIMENT: bit mask of extra Windows firmware commands: 1 RTA, 2 tuning scenario, 4 out-chan rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime range, 0x40 global ENABLE_PREFETCH (0 = none)");
+@@ -127,7 +127,7 @@
+  * The firmware logs its reading as "RTPipe MMHub Prefetch", "SoftRTPipe MMHub Prefetch", "Add YUV GAP".
+  * Default 7 = {1,1,1}, the patch 0029 behaviour.  Only used when win_cmds has bit 0x40.
+  */
+-static unsigned int prefetch_flags = 7;
++static unsigned int prefetch_flags = 1;	/* patch 0035: RT-pipe prefetch only */
+ module_param(prefetch_flags, uint, 0444);
+ MODULE_PARM_DESC(prefetch_flags,
+ 		 "EXPERIMENT: ENABLE_PREFETCH payload, bit N -> word N (0..2), default 7 = {1,1,1}; needs win_cmds bit 0x40");
+@@ -309,7 +309,7 @@
+  * the buffer-send path (start_streaming), during which the host cannot queue buffers and frames are
+  * dropped ("Preview buffer is not available").  phy_diag=0 skips them.  Default 1 = as before.
+  */
+-static bool phy_diag = true;
++static bool phy_diag;	/* patch 0035: default off (no sleeps in the send path) */
+ module_param(phy_diag, bool, 0444);
+ MODULE_PARM_DESC(phy_diag, "EXPERIMENT: D-PHY state dumps (+100 ms, +1 s) after the sensor starts; 0 skips the 1.1 s of sleeps");
+ 
+@@ -433,7 +433,7 @@
+ #define EXP_META_DATA_BUF_SIZE		0x20000
+ #define EXP_META_DATA_BUF_MAX		6
+ 
+-static unsigned int meta_data_bufs;
++static unsigned int meta_data_bufs = 6;	/* patch 0035: like Windows */
+ module_param(meta_data_bufs, uint, 0444);
+ MODULE_PARM_DESC(meta_data_bufs,
+ 		 "EXPERIMENT: send N (max 6) type-13 META_DATA buffers of 128 KiB before START_STREAM, like Windows (0 = off)");
+@@ -455,7 +455,7 @@
+  * which META_DATA buffer was used, so they are re-sent round-robin in submission order (INFERENCE:
+  * the firmware consumes them in order, one per frame).  Needs meta_data_bufs.
+  */
+-static bool meta_data_resend;
++static bool meta_data_resend = true;	/* patch 0035: default on */
+ module_param(meta_data_resend, bool, 0444);
+ MODULE_PARM_DESC(meta_data_resend,
+ 		 "EXPERIMENT: re-send one type-13 META_DATA buffer (round-robin) after every frame-done, like Windows");

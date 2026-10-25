@@ -1,0 +1,138 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -577,6 +577,8 @@
+ 	exp_sensor_sd = sd;
+ }
+ 
++static void isp4sd_exp_af_cancel(void);	/* patch 0050, defined with the AF drive below */
++
+ static void isp4sd_exp_sensor_stop(struct device *dev)
+ {
+ 	int ret;
+@@ -588,6 +590,7 @@
+ 	if (!exp_sensor_dev)
+ 		return;
+ 
++	isp4sd_exp_af_cancel();			/* patch 0050: no AF write in flight past this point */
+ 	isp4sd_exp_focus_attach(NULL, NULL);	/* patch 0043: no motor writes once the sensor stops */
+ 	ret = v4l2_subdev_call(exp_sensor_sd, video, s_stream, 0);
+ 	dev_info(dev, "EXP-SENSOR: %s s_stream(0) -> %d\n", exp_sensor_sd->name, ret);
+@@ -658,22 +661,33 @@
+ 
+ static unsigned int exp_af_meta_frames;	/* frames logged in this stream */
+ 
+-static void isp4sd_exp_af_meta_log(struct device *dev, const void *meta_info)
++/* the 3A result buffer this frame's meta info points to, if it is one of ours (index in *idx); else NULL */
++static const u8 *isp4sd_exp_3a_buf(const void *meta_info, unsigned int *idx)
+ {
+-	const u8 *mi = meta_info, *d = NULL;
+-	u32 valid = get_unaligned_le32(mi + 0x108 * 4);
++	const u8 *mi = meta_info;
+ 	u64 addr = get_unaligned_le64(mi + 0x45c);
+ 	unsigned int i;
+ 
+-	if (exp_af_meta_frames >= af_meta_log)
+-		return;
+-	exp_af_meta_frames++;
+ 	for (i = 0; i < exp_meta_data_cnt; i++) {
+ 		if (exp_meta_data[i].gpu_addr == addr) {
+-			d = exp_meta_data[i].cpu_addr;
+-			break;
++			*idx = i;
++			return exp_meta_data[i].cpu_addr;
+ 		}
+ 	}
++	return NULL;
++}
++
++static void isp4sd_exp_af_meta_log(struct device *dev, const void *meta_info)
++{
++	const u8 *mi = meta_info, *d;
++	u32 valid = get_unaligned_le32(mi + 0x108 * 4);
++	u64 addr = get_unaligned_le64(mi + 0x45c);
++	unsigned int i = 0;
++
++	if (exp_af_meta_frames >= af_meta_log)
++		return;
++	exp_af_meta_frames++;
++	d = isp4sd_exp_3a_buf(meta_info, &i);
+ 	if (!valid || !d) {
+ 		dev_info(dev, "EXP-AFMETA: poc %u: word 0x108 = %u, 3A buffer 0x%llx %s\n",
+ 			 get_unaligned_le32(mi), valid, addr, d ? "" : "(not one of our META_DATA buffers)");
+@@ -686,6 +700,60 @@
+ 		 get_unaligned_le32(d + 0x11c), get_unaligned_le32(d + 0x174));
+ }
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0050): close the AF loop on the host (findings 126). The firmware's AF computes a
++ * lens target every frame (3A result +0x110, 0..4095) but never writes the motor. af_drive=1 takes that target
++ * at frame-done, converts it to the motor scale (/4, 0..1023, as the firmware's own "virtual position(4092) ->
++ * hw_position (1023)") and, when it changed, writes it through isp4sd_set_focus() (firmware I2C while
++ * streaming, patch 0045). The write is a sync stream command whose answer comes on this same response thread,
++ * so it runs from a work item; a newer target replaces one not yet written. Default 0 = off; while on, the AF
++ * owns the lens (focus_absolute changes are overwritten by the next target).
++ */
++static bool af_drive;
++module_param(af_drive, bool, 0444);
++MODULE_PARM_DESC(af_drive,
++		 "EXPERIMENT: drive the focus motor with the firmware's per-frame AF lens target (via firmware I2C); default off");
++
++static int exp_af_pending = -1;		/* motor position to write, -1 = none (xchg) */
++static int exp_af_last = -1;		/* last position queued in this stream */
++
++static void isp4sd_exp_af_work_fn(struct work_struct *work)
++{
++	int pos = xchg(&exp_af_pending, -1);
++
++	if (pos >= 0)
++		isp4sd_set_focus(pos);
++}
++
++static DECLARE_WORK(exp_af_work, isp4sd_exp_af_work_fn);
++
++static void isp4sd_exp_af_cancel(void)
++{
++	cancel_work_sync(&exp_af_work);
++	exp_af_pending = -1;
++}
++
++static void isp4sd_exp_af_drive(struct device *dev, const void *meta_info)
++{
++	unsigned int idx;
++	const u8 *d;
++	int pos;
++
++	if (!af_drive || !get_unaligned_le32((const u8 *)meta_info + 0x108 * 4))
++		return;
++	d = isp4sd_exp_3a_buf(meta_info, &idx);
++	if (!d)
++		return;
++	pos = min(get_unaligned_le32(d + 0x110) / 4, (u32)ISP4SD_FOCUS_MAX);
++	if (pos == exp_af_last)
++		return;
++	dev_info(dev, "EXP-AF: poc %u: AF state %u, target %u -> motor %d\n",
++		 get_unaligned_le32(meta_info), get_unaligned_le32(d + 0x88), get_unaligned_le32(d + 0x110), pos);
++	exp_af_last = pos;
++	xchg(&exp_af_pending, pos);
++	schedule_work(&exp_af_work);
++}
++
+ static void isp4sd_exp_meta_data_free(void)
+ {
+ 	for (unsigned int i = 0; i < exp_meta_data_cnt; i++)
+@@ -830,6 +898,7 @@
+ 		dev_info(dev, "EXP: sent %u type-13 META_DATA buffers of 0x%x bytes\n", want, EXP_META_DATA_BUF_SIZE);
+ 		exp_meta_data_next = 0;		/* patch 0034: round-robin re-send starts at the first buffer */
+ 		exp_af_meta_frames = 0;		/* patch 0049: log the first frames of every stream */
++		exp_af_last = -1;		/* patch 0050: first AF target of the stream is always written */
+ 		memset(&buf_type, 0, sizeof(buf_type));
+ 	}
+ 
+@@ -1401,6 +1470,7 @@
+ 		return;
+ 	}
+ 	isp4sd_exp_af_meta_log(dev, meta);	/* patch 0049 */
++	isp4sd_exp_af_drive(dev, meta);		/* patch 0050 */
+ 
+ 	dev_dbg(dev, "ts:%llu,streamId:%d,poc:%u,preview_en:%u,status:%s(%i)\n",
+ 		ktime_get_ns(), stream_id, meta->poc, meta->preview.enabled,

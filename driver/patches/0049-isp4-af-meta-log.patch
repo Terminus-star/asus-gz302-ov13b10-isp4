@@ -1,0 +1,69 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -642,6 +642,50 @@
+ 
+ static unsigned int exp_meta_data_next;	/* next META_DATA buffer to re-send */
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0049): the firmware's per-frame AF state, read-only (findings 124/125). Windows'
++ * isp_fw_resp_frame_done (amdcamera.sys 0x14001211c) reads, when meta-info word 0x108 is non-zero, a 3A result
++ * buffer whose GPU address is the u64 at meta-info byte 0x45c, and logs from it +0x88 (AF state), +0x110 (the
++ * value that steps 256 -> 1856 during Windows' AF scan; INFERENCE: lens target 0..4095) and +0x70, +0xa0, +0xa4,
++ * +0xbc (float, printed as hex), +0xc0, +0xe8, +0x11c, +0x174 (meaning unknown). INFERENCE: that buffer is one of
++ * our META_DATA (type 13) buffers; the log says which one, or "not ours".
++ *   af_meta_log=N logs the first N frames of every stream (0 = off, default).
++ */
++static unsigned int af_meta_log;
++module_param(af_meta_log, uint, 0444);
++MODULE_PARM_DESC(af_meta_log,
++		 "EXPERIMENT: log the firmware's AF state and lens target from the 3A result buffer for the first N frames of each stream (0 = off)");
++
++static unsigned int exp_af_meta_frames;	/* frames logged in this stream */
++
++static void isp4sd_exp_af_meta_log(struct device *dev, const void *meta_info)
++{
++	const u8 *mi = meta_info, *d = NULL;
++	u32 valid = get_unaligned_le32(mi + 0x108 * 4);
++	u64 addr = get_unaligned_le64(mi + 0x45c);
++	unsigned int i;
++
++	if (exp_af_meta_frames >= af_meta_log)
++		return;
++	exp_af_meta_frames++;
++	for (i = 0; i < exp_meta_data_cnt; i++) {
++		if (exp_meta_data[i].gpu_addr == addr) {
++			d = exp_meta_data[i].cpu_addr;
++			break;
++		}
++	}
++	if (!valid || !d) {
++		dev_info(dev, "EXP-AFMETA: poc %u: word 0x108 = %u, 3A buffer 0x%llx %s\n",
++			 get_unaligned_le32(mi), valid, addr, d ? "" : "(not one of our META_DATA buffers)");
++		return;
++	}
++	dev_info(dev, "EXP-AFMETA: poc %u buf %u: af_state %u lens %u | 70 %u a0 %u a4 %u bc %08x c0 %u e8 %u 11c %u 174 %u\n",
++		 get_unaligned_le32(mi), i, get_unaligned_le32(d + 0x88), get_unaligned_le32(d + 0x110),
++		 get_unaligned_le32(d + 0x70), get_unaligned_le32(d + 0xa0), get_unaligned_le32(d + 0xa4),
++		 get_unaligned_le32(d + 0xbc), get_unaligned_le32(d + 0xc0), get_unaligned_le32(d + 0xe8),
++		 get_unaligned_le32(d + 0x11c), get_unaligned_le32(d + 0x174));
++}
++
+ static void isp4sd_exp_meta_data_free(void)
+ {
+ 	for (unsigned int i = 0; i < exp_meta_data_cnt; i++)
+@@ -785,6 +829,7 @@
+ 		}
+ 		dev_info(dev, "EXP: sent %u type-13 META_DATA buffers of 0x%x bytes\n", want, EXP_META_DATA_BUF_SIZE);
+ 		exp_meta_data_next = 0;		/* patch 0034: round-robin re-send starts at the first buffer */
++		exp_af_meta_frames = 0;		/* patch 0049: log the first frames of every stream */
+ 		memset(&buf_type, 0, sizeof(buf_type));
+ 	}
+ 
+@@ -1355,6 +1400,7 @@
+ 		dev_err(dev, "fail to get meta from mc %llx\n", mc);
+ 		return;
+ 	}
++	isp4sd_exp_af_meta_log(dev, meta);	/* patch 0049 */
+ 
+ 	dev_dbg(dev, "ts:%llu,streamId:%d,poc:%u,preview_en:%u,status:%s(%i)\n",
+ 		ktime_get_ns(), stream_id, meta->poc, meta->preview.enabled,

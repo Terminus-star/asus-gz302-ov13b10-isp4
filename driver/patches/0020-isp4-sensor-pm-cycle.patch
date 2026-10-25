@@ -1,0 +1,40 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -43,6 +43,19 @@
+ MODULE_PARM_DESC(start_sensor,
+ 		 "EXPERIMENT: start the OV13B via ov13b10 s_stream: 0 off, 1 after START_STREAM is queued, 2 before");
+ 
++/*
++ * EXPERIMENT (GZ302): the sensor's enable pin is a GPIO of the ISP block (amdisp-pinctrl GPIO 0, mapped as the
++ * ov13b10 "reset" line by an earlier patch) and that block is power-gated when idle.  The sensor was alive at
++ * probe, but the NACKs of findings section 36 suggest the pin state is lost while the ov13b10 driver still
++ * thinks it is powered (runtime status "active").  With sensor_pm_cycle=1 the sensor is forced through its own
++ * runtime suspend and resume once the ISP is up (power_off then power_on of the driver: the reset GPIO is
++ * asserted and released again), before the raw I2C probe and s_stream.  Needs start_sensor != 0.
++ */
++static bool sensor_pm_cycle;
++module_param(sensor_pm_cycle, bool, 0444);
++MODULE_PARM_DESC(sensor_pm_cycle,
++		 "EXPERIMENT: force an ov13b10 runtime suspend+resume (re-drives its enable GPIO) before starting it; needs start_sensor");
++
+ static struct device *exp_sensor_dev;		/* reference held while the sensor streams */
+ static struct v4l2_subdev *exp_sensor_sd;
+ 
+@@ -100,6 +113,17 @@
+ 		return;
+ 	}
+ 
++	if (sensor_pm_cycle) {
++		int r_susp, r_res;
++
++		isp4sd_exp_i2c_probe(dev, client, "before pm cycle");
++		r_susp = pm_runtime_force_suspend(&client->dev);
++		r_res = pm_runtime_force_resume(&client->dev);
++		dev_info(dev, "EXP-SENSOR: forced runtime PM cycle of the sensor: suspend %d, resume %d, runtime-active %d\n",
++			 r_susp, r_res, pm_runtime_active(&client->dev));
++		isp4sd_exp_i2c_probe(dev, client, "after pm cycle");
++	}
++
+ 	isp4sd_exp_i2c_probe(dev, client, "before s_stream");
+ 
+ 	ret = v4l2_subdev_call(sd, video, s_stream, 1);

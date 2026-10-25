@@ -1,0 +1,41 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -878,6 +878,30 @@
+ 	kfree(copy);
+ }
+ 
++/*
++ * Does 0x1b mean "this command is not supported" (findings section 19)?  Send a command ID that
++ * cannot exist and compare the firmware's error code in the EXP-RESP line with the 0x1b of
++ * SET_SENSOR_PROP.  Same code = the firmware treats SET_SENSOR_PROP like an unknown command.
++ * 0 = off.  Accepts decimal or 0x.. hex.
++ */
++static unsigned int bogus_cmd;
++module_param(bogus_cmd, uint, 0644);
++MODULE_PARM_DESC(bogus_cmd,
++		 "EXPERIMENT: also send this (invalid) command ID, e.g. 0x0badbad, to learn the firmware's error code for unknown commands; 0 = off");
++
++static void isp4if_replay_bogus_cmd(struct isp4_interface *ispif)
++{
++	u32 pkg[4] = { 0, 0, 0, 0 };
++	int ret;
++
++	if (!bogus_cmd)
++		return;
++
++	ret = isp4if_send_command_sync(ispif, bogus_cmd, pkg, sizeof(pkg));
++	dev_info(ispif->dev, "EXP-REPLAY: BOGUS cmd 0x%08x (4 zero words) -> %s (%d)\n", bogus_cmd,
++		 ret ? "NO ANSWER / FAILED" : "answered", ret);
++}
++
+ int isp4if_replay_sensor_setup(struct isp4_interface *ispif)
+ {
+ 	if (!replay_sensor_setup)
+@@ -889,6 +913,7 @@
+ 	isp4if_replay_one(ispif, EXP_CMD_ID_SET_DEVICE_SCRIPT, "SET_DEVICE_SCRIPT",
+ 			  isp4_ov13b_script, ISP4_OV13B_SCRIPT_SIZE, &ispif->exp_sensor_script);
+ 	isp4if_replay_sensor_prop(ispif);
++	isp4if_replay_bogus_cmd(ispif);
+ 
+ 	isp4if_dump_rings(ispif, "replay: after");
+ 

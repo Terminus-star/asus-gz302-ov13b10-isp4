@@ -1,0 +1,34 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -20,6 +20,17 @@
+ /* EXPERIMENT (GZ302): firmware-visible copy of the tuning file, see isp4if_replay_tuning() */
+ static struct isp4if_gpu_mem_info *exp_tuning_mem;
+ 
++/*
++ * EXPERIMENT (GZ302): size of the firmware memory pool in MiB.  The stock driver sends 100 MiB
++ * (ISP4FW_MEMORY_POOL_SIZE, sized for the OV05C10); the Windows driver allocates 200 MiB
++ * (findings section 30) and the firmware runs out of internal buffers for the 13 MP OV13B mode with 100.
++ * 0 = keep the stock size.
++ */
++static unsigned int fw_mem_pool_mb;
++module_param(fw_mem_pool_mb, uint, 0444);
++MODULE_PARM_DESC(fw_mem_pool_mb,
++		 "EXPERIMENT: firmware memory pool size in MiB (0 = stock 100 MiB, Windows uses 200)");
++
+ #define ISP4IF_FW_RESP_RB_IRQ_EN_MASK \
+ 	(ISP_SYS_INT0_EN__SYS_INT_RINGBUFFER_WPT9_EN_MASK\
+ 	 | ISP_SYS_INT0_EN__SYS_INT_RINGBUFFER_WPT12_EN_MASK)
+@@ -193,8 +204,11 @@
+ {
+ 	struct device *dev = ispif->dev;
+ 
+-	ispif->fw_mem_pool = isp4if_gpu_mem_alloc(ispif,
+-						  ISP4FW_MEMORY_POOL_SIZE);
++	u64 pool_size = fw_mem_pool_mb ? (u64)fw_mem_pool_mb * SZ_1M : ISP4FW_MEMORY_POOL_SIZE;
++
++	dev_info(dev, "EXP: firmware memory pool %llu bytes (%s)\n", pool_size,
++		 fw_mem_pool_mb ? "fw_mem_pool_mb" : "stock");
++	ispif->fw_mem_pool = isp4if_gpu_mem_alloc(ispif, pool_size);
+ 	if (!ispif->fw_mem_pool)
+ 		goto error_no_memory;
+ 

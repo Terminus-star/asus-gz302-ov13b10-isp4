@@ -1,0 +1,11 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -80,7 +80,7 @@
+  *                 Linux ov13b10 one (findings section 59): above all 0x3813=0x08 (vertical window offset; Linux
+  *                 0x09 shifts the Bayer pattern by one row, suspected cause of the magenta cast, section 88)
+  */
+-static unsigned int sensor_pll = 3;	/* patch 0035: Windows PLL + mode registers */
++static unsigned int sensor_pll;	/* patch 0036: default 0, ov13b10 applies the GZ302 values itself (gz302_fixups) */
+ module_param(sensor_pll, uint, 0444);
+ MODULE_PARM_DESC(sensor_pll,
+ 		 "EXPERIMENT: after ov13b10 s_stream: 1 log the PLL registers, 2 also apply the Windows (24 MHz) PLL values, 3 also the other Windows mode registers (0x3813=08 ...)");

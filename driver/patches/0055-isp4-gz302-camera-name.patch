@@ -1,0 +1,47 @@
+--- a/drivers/media/platform/amd/isp4/isp4_video.c
++++ b/drivers/media/platform/amd/isp4/isp4_video.c
+@@ -3,6 +3,7 @@
+  * Copyright (C) 2025 Advanced Micro Devices, Inc.
+  */
+ 
++#include <linux/dmi.h>
+ #include <media/v4l2-event.h>
+ #include <media/v4l2-ioctl.h>
+ #include <media/v4l2-mc.h>
+@@ -23,6 +24,23 @@
+ 
+ static const char *const isp4vid_video_dev_name = "Preview";
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0055): the camera's name as applications show it (V4L2 card, e.g. in OBS or a browser's
++ * camera picker). Boards listed here get their product name instead of the driver name: the GZ302 rear camera is
++ * "ASUS 13M AF webcam", the FriendlyName in ASUS's Windows driver (amdcamera_ext.inf, sensorOV13B_ext.inf); its
++ * front camera is "ASUS 5M webcam". Other boards keep ISP4VID_ISP_DRV_NAME.
++ */
++static const struct dmi_system_id isp4vid_card_names[] = {
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
++			DMI_MATCH(DMI_BOARD_NAME, "GZ302"),
++		},
++		.driver_data = (void *)"ASUS 13M AF webcam",
++	},
++	{ }
++};
++
+ /* Sizes must be in increasing order */
+ static const struct v4l2_frmsize_discrete isp4vid_frmsize[] = {
+ 	{640, 360},
+@@ -129,9 +147,11 @@
+ 				  struct v4l2_capability *cap)
+ {
+ 	struct isp4vid_dev *isp_vdev = video_drvdata(file);
++	const struct dmi_system_id *board = dmi_first_match(isp4vid_card_names);	/* patch 0055 */
+ 
+ 	strscpy(cap->driver, ISP4VID_ISP_DRV_NAME, sizeof(cap->driver));
+-	snprintf(cap->card, sizeof(cap->card), "%s", ISP4VID_ISP_DRV_NAME);
++	snprintf(cap->card, sizeof(cap->card), "%s",
++		 board ? (const char *)board->driver_data : ISP4VID_ISP_DRV_NAME);
+ 	cap->capabilities |= V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_CAPTURE;
+ 
+ 	dev_dbg(isp_vdev->dev, "%s|capabilities=0x%X\n", isp_vdev->vdev.name,

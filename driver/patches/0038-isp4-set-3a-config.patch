@@ -1,0 +1,141 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -69,6 +69,8 @@
+ 
+ /* EXPERIMENT (GZ302): firmware-visible copy of the tuning file, see isp4if_replay_tuning() */
+ static struct isp4if_gpu_mem_info *exp_tuning_mem;
++/* EXPERIMENT (GZ302, patch 0038): SET_3A_CONFIG payload, see isp4if_send_3a_config() */
++static struct isp4if_gpu_mem_info *exp_3a_mem;
+ 
+ /*
+  * EXPERIMENT (GZ302): size of the firmware memory pool in MiB.  The stock driver sends 100 MiB
+@@ -260,6 +262,8 @@
+ 		isp4if_gpu_mem_free(ispif, &ispif->exp_sensor_prop);
+ 	if (exp_tuning_mem)
+ 		isp4if_gpu_mem_free(ispif, &exp_tuning_mem);
++	if (exp_3a_mem)		/* patch 0038 */
++		isp4if_gpu_mem_free(ispif, &exp_3a_mem);
+ 
+ 	for (unsigned int i = 0; i < ISP4IF_MAX_STREAM_BUF_COUNT; i++)
+ 		isp4if_gpu_mem_free(ispif, &ispif->meta_info_buf[i]);
+@@ -1002,6 +1006,68 @@
+ }
+ 
+ /*
++ * EXPERIMENT (GZ302, patch 0038): SET_3A_CONFIG, which Windows sends once per stream start (after
++ * the META buffers, before ENABLE_PREFETCH) and Linux never did, so the firmware's autofocus stayed
++ * idle (findings section 101). 92 bytes, sent indirect like the sensor setup. Windows kickoff values,
++ * read from isp_setup_3a and confirmed by the values Windows logged: flags 0x223, AE auto, flicker
++ * auto, AWB auto, AF mode 4 = CONTINUOUS_VIDEO. Only the fields whose flag bit is set are used.
++ */
++#define EXP_CMD_ID_SET_3A_CONFIG	0x02020001
++
++#define EXP_3A_F_AE_MODE	0x001
++#define EXP_3A_F_FLICKER	0x002
++#define EXP_3A_F_AWB_MODE	0x020
++#define EXP_3A_F_AF_MODE	0x200
++
++struct isp4if_exp_3a_config {
++	u32 flags;		/* 0x00 which fields below are valid */
++	u32 ae_mode;		/* 0x04 1 manual, 2 auto */
++	u32 flicker;		/* 0x08 1 off, 2 50 Hz, 3 60 Hz, 4 auto */
++	u32 ev_comp[2];		/* 0x0c {numerator, denominator}, flag 0x004 */
++	u32 itime;		/* 0x14 exposure time, flag 0x008 */
++	u32 iso;		/* 0x18 flag 0x010 */
++	u32 awb_mode;		/* 0x1c 1 auto, 2 manual gains, 3 light source, 4 colour temperature */
++	u32 rsvd20[4];		/* 0x20 */
++	u32 awb_param;		/* 0x30 flag 0x080 */
++	u32 common_para;	/* 0x34 flag 0x100 */
++	u32 af_mode;		/* 0x38 1 manual, 2 one shot, 3 continuous picture, 4 continuous video */
++	u32 backlight;		/* 0x3c flag 0x400 */
++	u32 rsvd40;		/* 0x40 */
++	u32 pair[4];		/* 0x44 two {valid, value} pairs, flag 0x800 (not set by Windows here) */
++	u32 lens_pos;		/* 0x54 manual focus position, flag 0x1000 */
++	u32 af_scene;		/* 0x58 0 normal, 1 macro, flag 0x2000 */
++} __packed;
++
++static unsigned int af_mode = 4;
++module_param(af_mode, uint, 0444);
++MODULE_PARM_DESC(af_mode,
++		 "EXPERIMENT: AF mode in SET_3A_CONFIG (win_cmds bit 0x80): 0 = leave AF out (flags 0x23), 1 manual, 2 one shot, 3 continuous picture, 4 continuous video (Windows, default)");
++
++void isp4if_send_3a_config(struct isp4_interface *ispif)
++{
++	struct isp4if_exp_3a_config cfg = {
++		.flags = EXP_3A_F_AE_MODE | EXP_3A_F_FLICKER | EXP_3A_F_AWB_MODE,
++		.ae_mode = 2,
++		.flicker = 4,
++		.awb_mode = 1,
++	};
++
++	BUILD_BUG_ON(sizeof(cfg) != 0x5c);
++	if (af_mode) {
++		cfg.flags |= EXP_3A_F_AF_MODE;
++		cfg.af_mode = af_mode;
++	}
++
++	/* a previous stream start left its payload buffer; the firmware has read it by now */
++	if (exp_3a_mem)
++		isp4if_gpu_mem_free(ispif, &exp_3a_mem);
++	dev_info(ispif->dev, "EXP-3A: SET_3A_CONFIG flags 0x%x, AE %u, flicker %u, AWB %u, AF %u\n",
++		 cfg.flags, cfg.ae_mode, cfg.flicker, cfg.awb_mode, cfg.af_mode);
++	isp4if_replay_one(ispif, EXP_CMD_ID_SET_3A_CONFIG, "SET_3A_CONFIG", &cfg, sizeof(cfg),
++			  &exp_3a_mem);
++}
++
++/*
+  * SET_SENSOR_PROP was rejected with fw_error_code 0x1b (findings section 18).  Send altered copies
+  * of the payload and watch whether the code changes (EXP-RESP line): a different code means a
+  * different check failed.
+--- a/drivers/media/platform/amd/isp4/isp4_interface.h
++++ b/drivers/media/platform/amd/isp4/isp4_interface.h
+@@ -124,6 +124,9 @@
+ /* EXPERIMENT (GZ302 bring-up): replay of the Windows sensor setup, no-op unless replay_sensor_setup=1 */
+ int isp4if_replay_sensor_setup(struct isp4_interface *ispif);
+ 
++/* EXPERIMENT (GZ302, patch 0038): Windows' SET_3A_CONFIG at stream start (starts the firmware's AF) */
++void isp4if_send_3a_config(struct isp4_interface *ispif);
++
+ int isp4if_send_command(struct isp4_interface *ispif, u32 cmd_id,
+ 			const void *package, u32 package_size);
+ 
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -96,8 +96,10 @@
+  *   0x10 SET_FPS_RANGE                   {15000, 30000}           after the META buffers, before the preview buffers
+  *   0x20 SET_ITIME_RANGE                 {40, 66666} (us)         right after SET_FPS_RANGE
+  *   0x40 ENABLE_PREFETCH (GLOBAL, patch 0029) {1, 1, 1}  (INFERRED payload)  after the META buffers, before SET_FPS_RANGE
+- * Not included (payload unknown or does not fit the 48-byte command slot): SET_3A_CONFIG (92 bytes, sent
+- * "indirect" by Windows), power/clock gating (global commands), SET_M2M_CAL_DATA, SET_ADAPTIVE_RTA.
++ *   0x80 SET_3A_CONFIG (patch 0038, 92 bytes, indirect: isp4if_send_3a_config(); AF mode from af_mode)
++ *        right after the META buffers, before ENABLE_PREFETCH
++ * Not included (payload unknown or does not fit the 48-byte command slot): power/clock gating
++ * (global commands), SET_M2M_CAL_DATA, SET_ADAPTIVE_RTA.
+  */
+ #define EXP_CMD_ID_ENABLE_RTA			0x02090008
+ #define EXP_CMD_ID_APPLY_TUNING_SCENARIO	0x02050009
+@@ -114,11 +116,12 @@
+ #define EXP_WIN_FPS_RANGE	0x10
+ #define EXP_WIN_ITIME_RANGE	0x20
+ #define EXP_WIN_PREFETCH	0x40
++#define EXP_WIN_3A_CONFIG	0x80	/* patch 0038 */
+ 
+ static unsigned int win_cmds = 0x77;	/* patch 0035: all but scene mode */
+ module_param(win_cmds, uint, 0444);
+ MODULE_PARM_DESC(win_cmds,
+-		 "EXPERIMENT: bit mask of extra Windows firmware commands: 1 RTA, 2 tuning scenario, 4 out-chan rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime range, 0x40 global ENABLE_PREFETCH (0 = none)");
++		 "EXPERIMENT: bit mask of extra Windows firmware commands: 1 RTA, 2 tuning scenario, 4 out-chan rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime range, 0x40 global ENABLE_PREFETCH, 0x80 SET_3A_CONFIG (0 = none)");
+ 
+ /*
+  * EXPERIMENT (GZ302, patch 0030): with {1,1,1} the firmware hangs in MMhubPrefetchSingleStream during
+@@ -699,6 +702,10 @@
+ 		return -EINVAL;
+ 	}
+ 
++	/* EXPERIMENT (patch 0038): Windows sends its 3A setup (AE/AWB/AF modes) right after the META buffers */
++	if (win_cmds & EXP_WIN_3A_CONFIG)
++		isp4if_send_3a_config(ispif);
++
+ 	/* EXPERIMENT (patch 0029): Windows enables MMHUB prefetch (global command) before the fps range */
+ 	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_PREFETCH, EXP_CMD_ID_ENABLE_PREFETCH, "ENABLE_PREFETCH",
+ 			   (const u32 []){ prefetch_flags & 1, (prefetch_flags >> 1) & 1,

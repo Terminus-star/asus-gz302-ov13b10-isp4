@@ -1,0 +1,147 @@
+Note (2026-10-19): the two new files this patch originally added, isp4_ov13b_script.h and
+isp4_ov13b_sensor_prop.h, were removed from it: they hold data derived from the Windows driver and are not
+published; the tools that generated them are no longer in the repository, so this step can only be rebuilt
+with locally generated copies.
+Since patch 0037 the driver no longer compiles them in (it loads amdgpu/gz302-ov13b-*.bin as firmware).
+
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -4,11 +4,16 @@
+  */
+ 
+ #include <linux/iopoll.h>
++#include <linux/moduleparam.h>
++#include <linux/sizes.h>
+ 
+ #include "isp4_debug.h"
+ #include "isp4_fw_cmd_resp.h"
+ #include "isp4_hw_reg.h"
+ #include "isp4_interface.h"
++/* EXPERIMENT (GZ302): payloads generated from the Windows driver (not published) */
++#include "isp4_ov13b_script.h"
++#include "isp4_ov13b_sensor_prop.h"
+ 
+ #define ISP4IF_FW_RESP_RB_IRQ_EN_MASK \
+ 	(ISP_SYS_INT0_EN__SYS_INT_RINGBUFFER_WPT9_EN_MASK\
+@@ -167,6 +172,12 @@
+ 	isp4if_gpu_mem_free(ispif, &ispif->fw_cmd_resp_buf);
+ 	isp4if_gpu_mem_free(ispif, &ispif->fw_log_buf);
+ 
++	/* EXPERIMENT: only allocated when replay_sensor_setup=1 */
++	if (ispif->exp_sensor_script)
++		isp4if_gpu_mem_free(ispif, &ispif->exp_sensor_script);
++	if (ispif->exp_sensor_prop)
++		isp4if_gpu_mem_free(ispif, &ispif->exp_sensor_prop);
++
+ 	for (unsigned int i = 0; i < ISP4IF_MAX_STREAM_BUF_COUNT; i++)
+ 		isp4if_gpu_mem_free(ispif, &ispif->meta_info_buf[i]);
+ }
+@@ -764,6 +775,75 @@
+ 	}
+ }
+ 
++/*
++ * EXPERIMENT (GZ302 bring-up, not for upstream): replay of the Windows sensor setup.
++ *
++ * Windows sends, before SET_STREAM_CONFIG: SET_DEVICE_SCRIPT, then (not for the OV13B, whose
++ * embedded-property getter reports "unsupported") SET_SENSOR_EMB_PROP, then SET_SENSOR_PROP.
++ * Each is an "indirect" command: the payload sits in firmware-visible memory and the command
++ * carries {GPU address lo, hi, size, checksum}.  Linux sends none of them.
++ *
++ * Off unless replay_sensor_setup=1.  Commands are sent synchronously so the log shows, per
++ * command, whether the firmware answered within ISP4IF_FW_CMD_TIMEOUT; a timeout is only logged.
++ */
++#define EXP_CMD_ID_SET_SENSOR_PROP	0x02090001
++#define EXP_CMD_ID_SET_DEVICE_SCRIPT	0x02090002
++
++static bool replay_sensor_setup;
++module_param(replay_sensor_setup, bool, 0644);
++MODULE_PARM_DESC(replay_sensor_setup,
++		 "EXPERIMENT: send the Windows sensor setup (script + sensor properties) before SET_STREAM_CONFIG");
++
++static void isp4if_replay_one(struct isp4_interface *ispif, u32 cmd_id, const char *what,
++			      const void *data, u32 len,
++			      struct isp4if_gpu_mem_info **slot)
++{
++	struct device *dev = ispif->dev;
++	struct isp4if_gpu_mem_info *mem;
++	u32 pkg[4];
++	int ret;
++
++	mem = isp4if_gpu_mem_alloc(ispif, ALIGN(len, SZ_4K));
++	if (!mem) {
++		dev_err(dev, "EXP-REPLAY: %s: no GPU memory for %u bytes\n", what, len);
++		return;
++	}
++	*slot = mem;
++
++	memset(mem->sys_addr, 0, mem->mem_size);
++	memcpy(mem->sys_addr, data, len);
++
++	isp4if_split_addr64(mem->gpu_mc_addr, &pkg[0], &pkg[1]);
++	pkg[2] = len;
++	pkg[3] = isp4if_compute_check_sum(mem->sys_addr, len);
++
++	ret = isp4if_send_command_sync(ispif, cmd_id, pkg, sizeof(pkg));
++	dev_info(dev,
++		 "EXP-REPLAY: %s: cmd 0x%08x, %u bytes at GPU 0x%llx, checksum 0x%08x -> %s (%d)\n",
++		 what, cmd_id, len, mem->gpu_mc_addr, pkg[3],
++		 ret ? "NO ANSWER / FAILED" : "answered", ret);
++}
++
++int isp4if_replay_sensor_setup(struct isp4_interface *ispif)
++{
++	if (!replay_sensor_setup)
++		return 0;
++
++	dev_info(ispif->dev, "EXP-REPLAY: sending the Windows sensor setup before SET_STREAM_CONFIG\n");
++	isp4if_dump_rings(ispif, "replay: before");
++
++	isp4if_replay_one(ispif, EXP_CMD_ID_SET_DEVICE_SCRIPT, "SET_DEVICE_SCRIPT",
++			  isp4_ov13b_script, ISP4_OV13B_SCRIPT_SIZE, &ispif->exp_sensor_script);
++	isp4if_replay_one(ispif, EXP_CMD_ID_SET_SENSOR_PROP, "SET_SENSOR_PROP",
++			  isp4_ov13b_sensor_prop, ISP4_OV13B_SENSOR_PROP_SIZE,
++			  &ispif->exp_sensor_prop);
++
++	isp4if_dump_rings(ispif, "replay: after");
++
++	/* Never fail the bring-up because of the experiment: carry on so the result can be observed. */
++	return 0;
++}
++
+ int isp4if_send_command(struct isp4_interface *ispif, u32 cmd_id,
+ 			const void *package, u32 package_size)
+ {
+--- a/drivers/media/platform/amd/isp4/isp4_interface.h
++++ b/drivers/media/platform/amd/isp4/isp4_interface.h
+@@ -87,6 +87,9 @@
+ 
+ 	/* ISP fw buffers */
+ 	struct isp4if_gpu_mem_info *fw_log_buf;
++	/* EXPERIMENT (GZ302): firmware-visible copies of the replayed Windows sensor setup */
++	struct isp4if_gpu_mem_info *exp_sensor_script;
++	struct isp4if_gpu_mem_info *exp_sensor_prop;
+ 	struct isp4if_gpu_mem_info *fw_cmd_resp_buf;
+ 	struct isp4if_gpu_mem_info *fw_mem_pool;
+ 	struct isp4if_gpu_mem_info *meta_info_buf[ISP4IF_MAX_STREAM_BUF_COUNT];
+@@ -112,6 +115,9 @@
+ /* EXPERIMENT (GZ302 bring-up): log ring-buffer and interrupt state, see isp4_interface.c */
+ void isp4if_dump_rings(struct isp4_interface *ispif, const char *when);
+ 
++/* EXPERIMENT (GZ302 bring-up): replay of the Windows sensor setup, no-op unless replay_sensor_setup=1 */
++int isp4if_replay_sensor_setup(struct isp4_interface *ispif);
++
+ int isp4if_send_command(struct isp4_interface *ispif, u32 cmd_id,
+ 			const void *package, u32 package_size);
+ 
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -354,6 +354,9 @@
+ 		return ret;
+ 	}
+ 
++	/* EXPERIMENT (GZ302): Windows sends the sensor setup here, before the stream config */
++	isp4if_replay_sensor_setup(&isp_subdev->ispif);
++
+ 	ret = isp4sd_set_stream_path(isp_subdev);
+ 	if (ret) {

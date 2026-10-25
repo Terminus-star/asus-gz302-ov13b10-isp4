@@ -1,0 +1,45 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -967,6 +967,27 @@
+ MODULE_PARM_DESC(script_vcm_mode,
+ 		 "EXPERIMENT: VcmMode written into the SET_DEVICE_SCRIPT payload at 0x1618 (Windows: 1); -1 = leave as built");
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0046): the whole tail that Windows' get_fw_script_ctrl_OV13B fills (findings 118).
++ * Our script body is identical to Windows'; only these five words differ. With them and script_i2c=2 the
++ * checksum must be 0x05234c5f, the value in the Windows trace. Meanings are INFERENCE.
++ */
++static bool script_tail;
++module_param(script_tail, bool, 0444);
++MODULE_PARM_DESC(script_tail,
++		 "EXPERIMENT: write the Windows SET_DEVICE_SCRIPT tail words (0x15ec=10, 0x15f0=1176, 0x1614=2, 0x1618=1, 0x1640=1); default off");
++
++static const struct {
++	u32 off;
++	u32 val;
++} exp_script_tail[] = {
++	{ 0x15ec, 10 },		/* sensor group: line time in us (mode 0) */
++	{ 0x15f0, 1176 },	/* sensor group: line length in pixels */
++	{ 0x1614, 2 },		/* sensor group, last word */
++	{ 0x1618, 1 },		/* lens group: VcmMode */
++	{ 0x1640, 1 },		/* lens group, last word */
++};
++
+ static void isp4if_exp_put_i2c_desc(u8 *payload, unsigned int k, u32 addr, u32 code)
+ {
+ 	u32 *d = (u32 *)(payload + EXP_SCRIPT_I2C_DESC_OFF + k * EXP_SCRIPT_I2C_DESC_SIZE);
+@@ -1017,6 +1038,14 @@
+ 	    len >= EXP_SCRIPT_I2C_DESC_OFF + 4 * EXP_SCRIPT_I2C_DESC_SIZE)
+ 		isp4if_exp_script_i2c(dev, mem->sys_addr);
+ 
++	/* patch 0046: Windows' tail words; before 0040 so an explicit script_vcm_mode still wins */
++	if (cmd_id == EXP_CMD_ID_SET_DEVICE_SCRIPT && script_tail) {
++		for (unsigned int i = 0; i < ARRAY_SIZE(exp_script_tail); i++)
++			if (len >= exp_script_tail[i].off + sizeof(u32))
++				*(u32 *)(mem->sys_addr + exp_script_tail[i].off) = exp_script_tail[i].val;
++		dev_info(dev, "EXP-SCRIPT-TAIL: Windows tail written (expect checksum 0x05234c5f with script_i2c=2)\n");
++	}
++
+ 	/* patch 0040: VcmMode in the script tail, also before the checksum */
+ 	if (cmd_id == EXP_CMD_ID_SET_DEVICE_SCRIPT && script_vcm_mode >= 0 &&
+ 	    len >= EXP_SCRIPT_VCM_MODE_OFF + sizeof(u32)) {

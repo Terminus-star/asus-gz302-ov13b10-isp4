@@ -1,0 +1,100 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -944,6 +944,19 @@
+ module_param(script_i2c_restart, uint, 0444);
+ MODULE_PARM_DESC(script_i2c_restart, "EXPERIMENT: enRestart value for script_i2c (default 1)");
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0040): Windows' sensor plug-in (get_fw_script_ctrl_OV13B) puts its VcmMode
++ * (registry default 1) into the SET_DEVICE_SCRIPT tail at 0x1618, which we send as 0 (findings 107;
++ * INFERENCE: it is the "vcm mode" argument of the script's LensSetPos, 1 = with the slope bit).
++ * -1 (default) = leave the payload as built.
++ */
++#define EXP_SCRIPT_VCM_MODE_OFF	0x1618
++
++static int script_vcm_mode = -1;
++module_param(script_vcm_mode, int, 0444);
++MODULE_PARM_DESC(script_vcm_mode,
++		 "EXPERIMENT: VcmMode written into the SET_DEVICE_SCRIPT payload at 0x1618 (Windows: 1); -1 = leave as built");
++
+ static void isp4if_exp_put_i2c_desc(u8 *payload, unsigned int k, u32 addr, u32 code)
+ {
+ 	u32 *d = (u32 *)(payload + EXP_SCRIPT_I2C_DESC_OFF + k * EXP_SCRIPT_I2C_DESC_SIZE);
+@@ -994,6 +1007,14 @@
+ 	    len >= EXP_SCRIPT_I2C_DESC_OFF + 4 * EXP_SCRIPT_I2C_DESC_SIZE)
+ 		isp4if_exp_script_i2c(dev, mem->sys_addr);
+ 
++	/* patch 0040: VcmMode in the script tail, also before the checksum */
++	if (cmd_id == EXP_CMD_ID_SET_DEVICE_SCRIPT && script_vcm_mode >= 0 &&
++	    len >= EXP_SCRIPT_VCM_MODE_OFF + sizeof(u32)) {
++		*(u32 *)(mem->sys_addr + EXP_SCRIPT_VCM_MODE_OFF) = script_vcm_mode;
++		dev_info(dev, "EXP-SCRIPT-VCM: VcmMode %d written at payload 0x%x\n",
++			 script_vcm_mode, EXP_SCRIPT_VCM_MODE_OFF);
++	}
++
+ 	isp4if_split_addr64(mem->gpu_mc_addr, &pkg[0], &pkg[1]);
+ 	pkg[2] = len;
+ 	pkg[3] = isp4if_compute_check_sum(mem->sys_addr, len);
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -203,6 +203,44 @@
+ 	return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
+ }
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0040): focus motor (VCM) init. Windows' sensor plug-in (start_OV13B ->
++ * 0x140004d48) writes two 2-byte frames to the motor at I2C 0x0c at every stream start, with the sensor
++ * powered and before the mode table: DF 5B, then 19 04 (VcmMode 1, the Windows default; = park the lens
++ * at position 400 with the slope bit). Linux never did, and the lens never moved (findings 105, 107).
++ *   vcm_init=0 off (default), 1 = Windows (DF 5B, 19 04), 2 = mode-0 variant (DF 5B, 19 00).
++ */
++#define EXP_VCM_I2C_ADDR	0x0c
++
++static unsigned int vcm_init;
++module_param(vcm_init, uint, 0444);
++MODULE_PARM_DESC(vcm_init,
++		 "EXPERIMENT: init the focus motor at I2C 0x0c like Windows at stream start: 0 off, 1 DF 5B + 19 04 (Windows), 2 DF 5B + 19 00");
++
++/* one 2-byte frame to the motor (8-bit register, 8-bit value), on the sensor's adapter */
++static int isp4sd_exp_vcm_wr(struct i2c_client *client, u8 reg, u8 val)
++{
++	u8 buf[2] = { reg, val };
++	struct i2c_msg msg = { .addr = EXP_VCM_I2C_ADDR, .flags = 0, .len = sizeof(buf), .buf = buf };
++	int ret = i2c_transfer(client->adapter, &msg, 1);
++
++	return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++/* Caller makes sure the sensor (and so the motor supply) is powered. -ENXIO = the motor did not answer. */
++static void isp4sd_exp_vcm_init(struct device *dev, struct i2c_client *client, const char *when)
++{
++	u8 park = vcm_init == 2 ? 0x00 : 0x04;
++	int r1, r2;
++
++	if (!vcm_init)
++		return;
++	r1 = isp4sd_exp_vcm_wr(client, 0xdf, 0x5b);
++	r2 = isp4sd_exp_vcm_wr(client, 0x19, park);
++	dev_info(dev, "EXP-VCM: init at I2C 0x%02x %s (vcm_init %u): DF 5B -> %d, 19 %02X -> %d\n",
++		 EXP_VCM_I2C_ADDR, when, vcm_init, r1, park, r2);
++}
++
+ /* PLL, stream and MIPI timing registers that differ or matter between the Windows and Linux tables */
+ static const u16 exp_pll_regs[] = {
+ 	0x0100, 0x0303, 0x0305, 0x0321, 0x0323, 0x0324, 0x0325, 0x0326, 0x0327, 0x3011, 0x4800, 0x4837,
+@@ -366,8 +404,15 @@
+ 		dev_info(dev, "EXP-SENSOR: PHY start returned %d\n", ret);
+ 	}
+ 
++	/* patch 0040: like Windows, with the sensor powered and before it streams (needs the PM reference) */
++	if (pm_ref >= 0)
++		isp4sd_exp_vcm_init(dev, client, "before s_stream");
++
+ 	ret = v4l2_subdev_call(sd, video, s_stream, 1);
+ 	dev_info(dev, "EXP-SENSOR: %s s_stream(1) %s START_STREAM -> %d\n", sd->name, when, ret);
++	/* patch 0040: without the PHY start's PM reference, init the motor once the sensor is powered by s_stream */
++	if (!ret && pm_ref < 0)
++		isp4sd_exp_vcm_init(dev, client, "after s_stream");
+ 	if (!ret && sensor_pll) {
+ 		/* patch 0025: what the sensor really got, and optionally the Windows PLL values */
+ 		isp4sd_exp_pll_dump(dev, client, "after s_stream");

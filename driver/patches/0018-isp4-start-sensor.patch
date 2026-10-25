@@ -1,0 +1,143 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -3,9 +3,12 @@
+  * Copyright (C) 2025 Advanced Micro Devices, Inc.
+  */
+ 
++#include <linux/device.h>
++#include <linux/i2c.h>
+ #include <linux/moduleparam.h>
+ #include <linux/pm_domain.h>
+ #include <linux/units.h>
++#include <media/v4l2-subdev.h>
+ 
+ #include "isp4.h"
+ #include "isp4_debug.h"
+@@ -24,6 +27,74 @@
+ MODULE_PARM_DESC(min_start_bufs,
+ 		 "EXPERIMENT: buffers sent to the ISP before START_STREAM (default 4, use >= 1)");
+ 
++/*
++ * EXPERIMENT (GZ302 bring-up, not for upstream): nothing in this driver starts the OV13B sensor,
++ * so the firmware arms its MIPI receiver and times out with zero frames (findings section 32).
++ * With start_sensor != 0 the driver finds the ov13b10 I2C client on the ISP's own I2C bus and calls
++ * its V4L2 subdev s_stream(1) (power-on, chip-ID check, PLL and mode registers, stream-on) and
++ * s_stream(0) when the stream is torn down.
++ *   0 = off (default)   1 = start after START_STREAM has been queued   2 = start before it
++ */
++#define EXP_SENSOR_I2C_NAME "i2c-ov13b10"
++
++static unsigned int start_sensor;
++module_param(start_sensor, uint, 0444);
++MODULE_PARM_DESC(start_sensor,
++		 "EXPERIMENT: start the OV13B via ov13b10 s_stream: 0 off, 1 after START_STREAM is queued, 2 before");
++
++static struct device *exp_sensor_dev;		/* reference held while the sensor streams */
++static struct v4l2_subdev *exp_sensor_sd;
++
++static void isp4sd_exp_sensor_start(struct device *dev, const char *when)
++{
++	struct device *sdev;
++	struct i2c_client *client;
++	struct v4l2_subdev *sd;
++	int ret;
++
++	if (!start_sensor || exp_sensor_dev)
++		return;
++
++	sdev = bus_find_device_by_name(&i2c_bus_type, NULL, EXP_SENSOR_I2C_NAME);
++	if (!sdev) {
++		dev_err(dev, "EXP-SENSOR: no I2C device %s\n", EXP_SENSOR_I2C_NAME);
++		return;
++	}
++
++	client = i2c_verify_client(sdev);
++	sd = client ? i2c_get_clientdata(client) : NULL;
++	if (!sd) {
++		dev_err(dev, "EXP-SENSOR: %s has no subdev in its client data (driver not bound?)\n",
++			EXP_SENSOR_I2C_NAME);
++		put_device(sdev);
++		return;
++	}
++
++	ret = v4l2_subdev_call(sd, video, s_stream, 1);
++	dev_info(dev, "EXP-SENSOR: %s s_stream(1) %s START_STREAM -> %d\n", sd->name, when, ret);
++	if (ret) {
++		put_device(sdev);
++		return;
++	}
++
++	exp_sensor_dev = sdev;
++	exp_sensor_sd = sd;
++}
++
++static void isp4sd_exp_sensor_stop(struct device *dev)
++{
++	int ret;
++
++	if (!exp_sensor_dev)
++		return;
++
++	ret = v4l2_subdev_call(exp_sensor_sd, video, s_stream, 0);
++	dev_info(dev, "EXP-SENSOR: %s s_stream(0) -> %d\n", exp_sensor_sd->name, ret);
++	put_device(exp_sensor_dev);
++	exp_sensor_dev = NULL;
++	exp_sensor_sd = NULL;
++}
++
+ #define ISP4SD_PERFORMANCE_STATE_LOW 0
+ #define ISP4SD_PERFORMANCE_STATE_HIGH 1
+ 
+@@ -223,8 +294,13 @@
+ 
+ 	if (!sensor_info->start_stream_cmd_sent &&
+ 	    sensor_info->buf_sent_cnt >= min_start_bufs) {
+-		int ret = isp4if_send_command(ispif, ISP4FW_CMD_ID_START_STREAM,
+-					      NULL, 0);
++		int ret;
++
++		if (start_sensor == 2)
++			isp4sd_exp_sensor_start(dev, "before");
++
++		ret = isp4if_send_command(ispif, ISP4FW_CMD_ID_START_STREAM,
++					  NULL, 0);
+ 		if (ret) {
+ 			dev_err(dev, "EXP: START_STREAM failed (kickoff), ret %d, buf_sent %u, min %u\n",
+ 				ret, sensor_info->buf_sent_cnt, min_start_bufs);
+@@ -235,6 +311,8 @@
+ 			 sensor_info->buf_sent_cnt, min_start_bufs);
+ 		isp4if_dump_rings(ispif, "after START_STREAM queued (kickoff)");
+ 		sensor_info->start_stream_cmd_sent = true;
++		if (start_sensor == 1)
++			isp4sd_exp_sensor_start(dev, "after");
+ 	} else {
+ 		dev_dbg(dev,
+ 			"no send START_STREAM, start_sent %u, buf_sent %u\n",
+@@ -374,6 +452,8 @@
+ 	struct isp4_interface *ispif = &isp_subdev->ispif;
+ 	struct v4l2_mbus_framefmt *format;
+ 
++	isp4sd_exp_sensor_stop(isp_subdev->dev);	/* EXPERIMENT: no-op unless start_sensor started it */
++
+ 	format = v4l2_subdev_state_get_format(state, pad, 0);
+ 	if (!format) {
+ 		dev_err(isp_subdev->dev, "fail to get v4l2 format\n");
+@@ -880,6 +960,9 @@
+ 		isp_subdev->sensor_info.buf_sent_cnt++;
+ 
+ 		if (isp_subdev->sensor_info.buf_sent_cnt >= min_start_bufs) {
++			if (start_sensor == 2)
++				isp4sd_exp_sensor_start(dev, "before");
++
+ 			ret = isp4if_send_command(ispif,
+ 						  ISP4FW_CMD_ID_START_STREAM,
+ 						  NULL, 0);
+@@ -898,6 +981,8 @@
+ 				ISP4SD_START_STATUS_STARTED;
+ 			isp_subdev->sensor_info.status =
+ 				ISP4SD_START_STATUS_STARTED;
++			if (start_sensor == 1)
++				isp4sd_exp_sensor_start(dev, "after");
+ 		} else {
+ 			dev_dbg(dev,
+ 				"no send start, required %u, buf sent %u\n",

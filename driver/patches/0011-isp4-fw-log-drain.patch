@@ -1,0 +1,74 @@
+--- a/drivers/media/platform/amd/isp4/isp4_debug.c
++++ b/drivers/media/platform/amd/isp4/isp4_debug.c
+@@ -107,7 +107,7 @@
+ 					*le = 0;
+ 
+ 				if (*str != '\0')
+-					dev_dbg(isp->dev, "%s", str);
++					dev_info(isp->dev, "EXP-FWLOG: %s", str);
+ 
+ 				if (le) {
+ 					*le = 0x0A;
+@@ -120,13 +120,31 @@
+ 
+ 				temp_ch = str[tmp_len];
+ 				str[tmp_len] = 0;
+-				dev_dbg(isp->dev, "%s", str);
++				dev_info(isp->dev, "EXP-FWLOG: %s", str);
+ 				str[tmp_len] = temp_ch;
+ 				str = &str[tmp_len];
+ 			}
+ 		}
+ 	}
+ }
++
++/*
++ * EXPERIMENT (GZ302 bring-up, not for upstream).
++ *
++ * isp_fw_log_print() is normally only called when the response thread handles a response, so
++ * log text the firmware writes after its last response is never read.  This drains the firmware
++ * log ring on demand and reports the ring's own pointers, so "log empty" and "log never read"
++ * can be told apart.  Lines are printed as "EXP-FWLOG: <text>".
++ */
++void isp_fw_log_dump(struct isp4_subdev *isp, const char *when)
++{
++	u32 rd = isp4hw_rreg(isp->mmio, ISP_LOG_RB_RPTR0);
++	u32 wr = isp4hw_rreg(isp->mmio, ISP_LOG_RB_WPTR0);
++
++	dev_info(isp->dev, "EXP-FWLOG[%s]: log ring rd %u wr %u, enable_fw_log %d\n",
++		 when, rd, wr, isp->enable_fw_log);
++	isp_fw_log_print(isp);
++}
+ #endif
+ 
+ char *isp4dbg_get_buf_src_str(u32 src)
+--- a/drivers/media/platform/amd/isp4/isp4_debug.h
++++ b/drivers/media/platform/amd/isp4/isp4_debug.h
+@@ -17,6 +17,7 @@
+ void isp_debugfs_create(struct isp4_device *isp_dev);
+ void isp_debugfs_remove(struct isp4_device *isp_dev);
+ void isp_fw_log_print(struct isp4_subdev *isp);
++void isp_fw_log_dump(struct isp4_subdev *isp, const char *when);
+ 
+ #else
+ 
+@@ -24,6 +25,7 @@
+ #define isp_debugfs_create(cam) ((void)(cam))
+ #define isp_debugfs_remove(cam) ((void)(cam))
+ #define isp_fw_log_print(isp) ((void)(isp))
++#define isp_fw_log_dump(isp, when) ((void)(isp), (void)(when))
+ 
+ #endif /* CONFIG_DEBUG_FS */
+ 
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -734,6 +734,9 @@
+ {
+ 	struct device *dev = ispif->dev;
+ 
++	/* Also drain the firmware log ring: it is otherwise only read when a response arrives. */
++	isp_fw_log_dump(container_of(ispif, struct isp4_subdev, ispif), when);
++
+ 	dev_info(dev, "EXP-RING[%s]: INT0_EN 0x%08x INT0_STATUS 0x%08x ISP_STATUS 0x%08x\n",
+ 		 when, isp4hw_rreg(ispif->mmio, ISP_SYS_INT0_EN),
+ 		 isp4hw_rreg(ispif->mmio, ISP_SYS_INT0_STATUS),

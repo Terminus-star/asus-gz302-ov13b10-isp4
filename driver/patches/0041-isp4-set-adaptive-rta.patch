@@ -1,0 +1,56 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -98,6 +98,8 @@
+  *   0x40 ENABLE_PREFETCH (GLOBAL, patch 0029) {1, 1, 1}  (INFERRED payload)  after the META buffers, before SET_FPS_RANGE
+  *   0x80 SET_3A_CONFIG (patch 0038, 92 bytes, indirect: isp4if_send_3a_config(); AF mode from af_mode)
+  *        right after the META buffers, before ENABLE_PREFETCH
++ *  0x100 SET_ADAPTIVE_RTA (patch 0041) {0, 3, 3, 3, bytes 01 01 01 00}  right after START_STREAM succeeds
++ *        (Windows' registry defaults MemProfiling / adaptiveRtaType 3 / adaptiveRtaStrength 1,1,1; findings 106)
+  * Not included (payload unknown or does not fit the 48-byte command slot): power/clock gating
+  * (global commands), SET_M2M_CAL_DATA, SET_ADAPTIVE_RTA.
+  */
+@@ -117,11 +119,13 @@
+ #define EXP_WIN_ITIME_RANGE	0x20
+ #define EXP_WIN_PREFETCH	0x40
+ #define EXP_WIN_3A_CONFIG	0x80	/* patch 0038 */
++#define EXP_WIN_ADAPTIVE_RTA	0x100	/* patch 0041 */
++#define EXP_CMD_ID_SET_ADAPTIVE_RTA		0x0201000c
+ 
+ static unsigned int win_cmds = 0x77;	/* patch 0035: all but scene mode */
+ module_param(win_cmds, uint, 0444);
+ MODULE_PARM_DESC(win_cmds,
+-		 "EXPERIMENT: bit mask of extra Windows firmware commands: 1 RTA, 2 tuning scenario, 4 out-chan rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime range, 0x40 global ENABLE_PREFETCH, 0x80 SET_3A_CONFIG (0 = none)");
++		 "EXPERIMENT: bit mask of extra Windows firmware commands: 1 RTA, 2 tuning scenario, 4 out-chan rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime range, 0x40 global ENABLE_PREFETCH, 0x80 SET_3A_CONFIG, 0x100 SET_ADAPTIVE_RTA (0 = none)");
+ 
+ /*
+  * EXPERIMENT (GZ302, patch 0030): with {1,1,1} the firmware hangs in MMhubPrefetchSingleStream during
+@@ -149,6 +153,13 @@
+ 		 name, cmd_id, count, (int)(count * sizeof(u32)), words, ret);
+ }
+ 
++/* patch 0041: what Windows sends right after a successful START_STREAM (fw_if_set_adaptive_rta) */
++static void isp4sd_exp_after_start_stream(struct isp4_subdev *isp_subdev)
++{
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_ADAPTIVE_RTA, EXP_CMD_ID_SET_ADAPTIVE_RTA,
++			   "SET_ADAPTIVE_RTA", (const u32 []){ 0, 3, 3, 3, 0x00010101 }, 5);
++}
++
+ static struct device *exp_sensor_dev;		/* reference held while the sensor streams */
+ static struct v4l2_subdev *exp_sensor_sd;
+ 
+@@ -781,6 +792,7 @@
+ 
+ 		dev_info(dev, "EXP: START_STREAM queued to fw (kickoff), buf_sent %u, min %u\n",
+ 			 sensor_info->buf_sent_cnt, min_start_bufs);
++		isp4sd_exp_after_start_stream(isp_subdev);	/* patch 0041 */
+ 		isp4if_dump_rings(ispif, "after START_STREAM queued (kickoff)");
+ 		sensor_info->start_stream_cmd_sent = true;
+ 		if (start_sensor == 1)
+@@ -1480,6 +1492,7 @@
+ 			dev_info(dev, "EXP: START_STREAM queued to fw (img buf), buf_sent %u, min %u\n",
+ 				 isp_subdev->sensor_info.buf_sent_cnt,
+ 				 min_start_bufs);
++			isp4sd_exp_after_start_stream(isp_subdev);	/* patch 0041 */
+ 			isp4if_dump_rings(ispif, "after START_STREAM queued (img buf)");
+ 			isp_subdev->sensor_info.start_stream_cmd_sent = true;
+ 			isp_subdev->sensor_info.output_info.start_status =

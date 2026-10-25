@@ -1,0 +1,245 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -3,6 +3,7 @@
+  * Copyright (C) 2025 Advanced Micro Devices, Inc.
+  */
+ 
++#include <linux/firmware.h>
+ #include <linux/iopoll.h>
+ #include <linux/kernel_read_file.h>
+ #include <linux/moduleparam.h>
+@@ -13,10 +14,58 @@
+ #include "isp4_fw_cmd_resp.h"
+ #include "isp4_hw_reg.h"
+ #include "isp4_interface.h"
+-/* EXPERIMENT (GZ302): payloads generated from the Windows driver (not published) */
+-#include "isp4_ov13b_script.h"
+-#include "isp4_ov13b_sensor_prop.h"
+-#include "isp4_phy_seq.h"
++/*
++ * EXPERIMENT (GZ302, patch 0037): the three payloads generated from the Windows driver (device script,
++ * sensor properties, D-PHY receiver sequence) are no longer compiled in.  They are loaded at run time with
++ * request_firmware() from /lib/firmware/amdgpu/; the gz302-camera-firmware package builds them from the
++ * owner's Windows driver files.  A missing or malformed file is logged and that step is skipped.
++ */
++#define EXP_FW_SCRIPT		"amdgpu/gz302-ov13b-script.bin"
++#define EXP_FW_SENSOR_PROP	"amdgpu/gz302-ov13b-sensor-prop.bin"
++#define EXP_FW_PHY_SEQ		"amdgpu/gz302-ov13b-phy-seq.bin"
++#define EXP_SCRIPT_SIZE		5868	/* SET_DEVICE_SCRIPT payload */
++#define EXP_SENSOR_PROP_SIZE	360	/* SET_SENSOR_PROP payload */
++
++/* gz302-ov13b-phy-seq.bin: header, then count operations (little-endian) */
++#define EXP_PHY_MAGIC		0x48505a47	/* "GZPH" */
++#define EXP_PHY_VERSION		1
++#define ISP4_PHY_OP_RMW		0
++#define ISP4_PHY_OP_WRITE	1
++
++struct exp_phy_hdr {
++	__le32 magic;
++	__le32 version;
++	__le32 phy;
++	__le32 rate_mbps;
++	__le32 lanes;
++	__le32 count;
++};
++
++struct isp4_phy_op {
++	__le16 reg;
++	__le16 mask;
++	__le16 val;
++	__le16 kind;
++};
++
++static const struct firmware *isp4if_exp_get_fw(struct device *dev, const char *name, size_t want)
++{
++	const struct firmware *fw;
++	int ret = request_firmware(&fw, name, dev);
++
++	if (ret) {
++		dev_err(dev, "EXP-FW: cannot load %s: %d (install the gz302-camera-firmware package)\n",
++			name, ret);
++		return NULL;
++	}
++	if (want && fw->size != want) {
++		dev_err(dev, "EXP-FW: %s has %zu bytes, expected %zu\n", name, fw->size, want);
++		release_firmware(fw);
++		return NULL;
++	}
++	dev_info(dev, "EXP-FW: loaded %s (%zu bytes)\n", name, fw->size);
++	return fw;
++}
+ 
+ /* EXPERIMENT (GZ302): firmware-visible copy of the tuning file, see isp4if_replay_tuning() */
+ static struct isp4if_gpu_mem_info *exp_tuning_mem;
+@@ -968,13 +1017,21 @@
+ 
+ static void isp4if_replay_sensor_prop(struct isp4_interface *ispif)
+ {
+-	const u8 *data = isp4_ov13b_sensor_prop;
+-	u32 len = ISP4_OV13B_SENSOR_PROP_SIZE;
++	const struct firmware *fw;
++	u32 len = EXP_SENSOR_PROP_SIZE;
++	const u8 *data;
+ 	u8 *copy;
+ 
+-	copy = kmemdup(isp4_ov13b_sensor_prop, ISP4_OV13B_SENSOR_PROP_SIZE, GFP_KERNEL);
++	/* patch 0037: payload from /lib/firmware instead of a compiled-in table */
++	fw = isp4if_exp_get_fw(ispif->dev, EXP_FW_SENSOR_PROP, EXP_SENSOR_PROP_SIZE);
++	if (!fw)
++		return;
++	data = fw->data;
++
++	copy = kmemdup(fw->data, len, GFP_KERNEL);
+ 	if (!copy) {
+ 		dev_err(ispif->dev, "EXP-REPLAY: SET_SENSOR_PROP: no memory for the variant copy\n");
++		release_firmware(fw);
+ 		return;
+ 	}
+ 
+@@ -1004,6 +1061,7 @@
+ 	isp4if_replay_one(ispif, EXP_CMD_ID_SET_SENSOR_PROP, "SET_SENSOR_PROP", data, len,
+ 			  &ispif->exp_sensor_prop);
+ 	kfree(copy);
++	release_firmware(fw);
+ }
+ 
+ /*
+@@ -1034,7 +1092,7 @@
+  * EXPERIMENT (GZ302): start the MIPI D-PHY receiver from the host, as the Windows driver does for the
+  * Strix variants (findings section 41, function startup_seq_cdphy_rx).  The firmware arms the receiver but
+  * counts zero frame starts although the sensor streams, and the Linux ISP4 driver has no PHY code.
+- * The analog register list (isp4_phy_seq[]) was evaluated offline for phy 0, 1120 Mbps, 4 lanes.
++ * The analog register list (since patch 0037 the file amdgpu/gz302-ov13b-phy-seq.bin) was evaluated offline for phy 0, 1120 Mbps, 4 lanes.
+  * Off unless phy_init=1; called from the sensor start helper, with the sensor powered.
+  *
+  * Registers are ISP byte offsets, as in the Windows driver.  NOTE the mapping: ispif->mmio only covers
+@@ -1101,8 +1159,11 @@
+ {
+ 	void __iomem *m = ispif->mmio;		/* only for the index/data pair at 0x61f08/0x61f0c */
+ 	struct device *dev = ispif->dev;
+-	const u32 lane_mask = (2U << ISP4_PHY_SEQ_LANES) - 1;		/* 4 lanes: 0x1f */
+-	const u32 lane_rst = (1U << ISP4_PHY_SEQ_LANES) - 1;		/* 4 lanes: 0xf */
++	const struct exp_phy_hdr *hdr;
++	const struct isp4_phy_op *ops;
++	const struct firmware *fw;
++	u32 phy, rate, lanes, count;
++	u32 lane_mask, lane_rst;	/* 4 lanes: 0x1f and 0xf */
+ 	struct resource *res;
+ 	void __iomem *w;
+ 	u32 r, ready = 0, stop = 0, want;
+@@ -1111,22 +1172,49 @@
+ 	if (!phy_init)
+ 		return 0;
+ 
++	/* patch 0037: the analog register list comes from /lib/firmware (gz302-camera-firmware) */
++	fw = isp4if_exp_get_fw(dev, EXP_FW_PHY_SEQ, 0);
++	if (!fw)
++		return -ENOENT;
++	hdr = (const struct exp_phy_hdr *)fw->data;
++	if (fw->size < sizeof(*hdr) || le32_to_cpu(hdr->magic) != EXP_PHY_MAGIC ||
++	    le32_to_cpu(hdr->version) != EXP_PHY_VERSION) {
++		dev_err(dev, "EXP-PHY: %s: bad header\n", EXP_FW_PHY_SEQ);
++		release_firmware(fw);
++		return -EINVAL;
++	}
++	phy = le32_to_cpu(hdr->phy);
++	rate = le32_to_cpu(hdr->rate_mbps);
++	lanes = le32_to_cpu(hdr->lanes);
++	count = le32_to_cpu(hdr->count);
++	if (phy > 3 || lanes < 1 || lanes > 4 || fw->size != sizeof(*hdr) + (size_t)count * sizeof(*ops)) {
++		dev_err(dev, "EXP-PHY: %s: phy %u, lanes %u, %u operations do not match %zu bytes\n",
++			EXP_FW_PHY_SEQ, phy, lanes, count, fw->size);
++		release_firmware(fw);
++		return -EINVAL;
++	}
++	ops = (const struct isp4_phy_op *)(fw->data + sizeof(*hdr));
++	lane_mask = (2U << lanes) - 1;
++	lane_rst = (1U << lanes) - 1;
++
+ 	/* ISP offset 0 is the start of the capture device's first memory resource (see the comment above) */
+ 	res = platform_get_resource(to_platform_device(dev), IORESOURCE_MEM, 0);
+ 	if (!res) {
+ 		dev_err(dev, "EXP-PHY: no memory resource on the capture device\n");
++		release_firmware(fw);
+ 		return -ENODEV;
+ 	}
+ 	w = ioremap(res->start + EXP_PHY_WIN, EXP_PHY_WIN_SIZE);
+ 	if (!w) {
+ 		dev_err(dev, "EXP-PHY: cannot map the PHY register range\n");
++		release_firmware(fw);
+ 		return -ENOMEM;
+ 	}
+ 	dev_info(dev, "EXP-PHY: mapped ISP offsets 0x%x-0x%x (physical 0x%llx)\n", EXP_PHY_WIN,
+ 		 EXP_PHY_WIN + EXP_PHY_WIN_SIZE - 1, (unsigned long long)(res->start + EXP_PHY_WIN));
+ 
+-	dev_info(dev, "EXP-PHY: starting the D-PHY receiver (phy %d, %d Mbps, %d lanes), %zu register operations\n",
+-		 ISP4_PHY_SEQ_PHY, ISP4_PHY_SEQ_RATE_MBPS, ISP4_PHY_SEQ_LANES, ARRAY_SIZE(isp4_phy_seq));
++	dev_info(dev, "EXP-PHY: starting the D-PHY receiver (phy %u, %u Mbps, %u lanes), %u register operations\n",
++		 phy, rate, lanes, count);
+ 	dev_info(dev, "EXP-PHY: before: global reset 0x%08x, ctl 0x%08x, status 0x%08x\n",
+ 		 phy_rd32(w, EXP_PHY_GLOBAL_RESET), phy_rd32(w, EXP_PHY_BASE),
+ 		 phy_rd32(w, EXP_PHY_BASE + 0x1c));
+@@ -1135,15 +1223,16 @@
+ 	if (phy_rd32(w, EXP_PHY_GLOBAL_RESET) == 0xffffffff && phy_rd32(w, EXP_PHY_BASE + 0x1c) == 0xffffffff) {
+ 		dev_err(dev, "EXP-PHY: PHY registers read as all-ones; not touching them\n");
+ 		iounmap(w);
++		release_firmware(fw);
+ 		return -EIO;
+ 	}
+ 
+ 	/* 1. pulse the PHY's bit in the global reset register */
+ 	r = phy_rd32(w, EXP_PHY_GLOBAL_RESET);
+-	phy_wr32(w, EXP_PHY_GLOBAL_RESET, r | BIT(ISP4_PHY_SEQ_PHY));
++	phy_wr32(w, EXP_PHY_GLOBAL_RESET, r | BIT(phy));
+ 	usleep_range(1000, 1500);
+ 	r = phy_rd32(w, EXP_PHY_GLOBAL_RESET);
+-	phy_wr32(w, EXP_PHY_GLOBAL_RESET, r & ~BIT(ISP4_PHY_SEQ_PHY));
++	phy_wr32(w, EXP_PHY_GLOBAL_RESET, r & ~BIT(phy));
+ 
+ 	/* 2. disable, lane masks, D-PHY mode */
+ 	phy_wr32(w, EXP_PHY_BASE + 0x00, 0);
+@@ -1152,14 +1241,15 @@
+ 	phy_wr32(w, EXP_PHY_BASE + 0x04, 0);
+ 
+ 	/* 3. analog configuration */
+-	for (i = 0; i < ARRAY_SIZE(isp4_phy_seq); i++) {
+-		const struct isp4_phy_op *op = &isp4_phy_seq[i];
++	for (i = 0; i < count; i++) {
++		const struct isp4_phy_op *op = &ops[i];
+ 
+-		if (op->kind == ISP4_PHY_OP_RMW)
+-			exp_phy_rmw(w, op->reg, op->mask, op->val);
++		if (le16_to_cpu(op->kind) == ISP4_PHY_OP_RMW)
++			exp_phy_rmw(w, le16_to_cpu(op->reg), le16_to_cpu(op->mask), le16_to_cpu(op->val));
+ 		else
+-			exp_phy_wr(w, op->reg, op->val);
++			exp_phy_wr(w, le16_to_cpu(op->reg), le16_to_cpu(op->val));
+ 	}
++	release_firmware(fw);	/* the operations are not needed after this point */
+ 
+ 	/* 4. enable and wait for "PHY ready" (Windows waits without a limit; here at most about 100 ms) */
+ 	phy_wr32(w, EXP_PHY_BASE + 0x00, 3);
+@@ -1292,14 +1382,21 @@
+ 
+ int isp4if_replay_sensor_setup(struct isp4_interface *ispif)
+ {
++	const struct firmware *fw;
++
+ 	if (!replay_sensor_setup)
+ 		return 0;
+ 
+ 	dev_info(ispif->dev, "EXP-REPLAY: sending the Windows sensor setup before SET_STREAM_CONFIG\n");
+ 	isp4if_dump_rings(ispif, "replay: before");
+ 
+-	isp4if_replay_one(ispif, EXP_CMD_ID_SET_DEVICE_SCRIPT, "SET_DEVICE_SCRIPT",
+-			  isp4_ov13b_script, ISP4_OV13B_SCRIPT_SIZE, &ispif->exp_sensor_script);
++	/* patch 0037: the compiled device script comes from /lib/firmware */
++	fw = isp4if_exp_get_fw(ispif->dev, EXP_FW_SCRIPT, EXP_SCRIPT_SIZE);
++	if (fw) {
++		isp4if_replay_one(ispif, EXP_CMD_ID_SET_DEVICE_SCRIPT, "SET_DEVICE_SCRIPT",
++				  fw->data, fw->size, &ispif->exp_sensor_script);
++		release_firmware(fw);
++	}
+ 	isp4if_replay_tuning(ispif);	/* Windows order: script, (embedded prop skipped), tuning, sensor prop */
+ 	isp4if_replay_sensor_prop(ispif);
+ 	isp4if_replay_bogus_cmd(ispif);

@@ -1,0 +1,49 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -1018,6 +1018,7 @@
+ #define EXP_3A_F_FLICKER	0x002
+ #define EXP_3A_F_AWB_MODE	0x020
+ #define EXP_3A_F_AF_MODE	0x200
++#define EXP_3A_F_LENS_POS	0x1000	/* patch 0039 */
+ 
+ struct isp4if_exp_3a_config {
+ 	u32 flags;		/* 0x00 which fields below are valid */
+@@ -1043,6 +1044,17 @@
+ MODULE_PARM_DESC(af_mode,
+ 		 "EXPERIMENT: AF mode in SET_3A_CONFIG (win_cmds bit 0x80): 0 = leave AF out (flags 0x23), 1 manual, 2 one shot, 3 continuous picture, 4 continuous video (Windows, default)");
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0039): manual focus, to test whether the firmware can move the lens at all
++ * (findings section 103). Windows' isp_fw_set_lens_pos (0x140026d74) sends SET_3A_CONFIG with flags
++ * 0x1200 (lens position + AF mode), AF mode 1 = MANUAL and the position at +0x54. The AF library's
++ * range is 0..4095, 300 = infinity, 4095 = macro. -1 (default) = off, af_mode is used as before.
++ */
++static int lens_pos = -1;
++module_param(lens_pos, int, 0444);
++MODULE_PARM_DESC(lens_pos,
++		 "EXPERIMENT: manual lens position 0..4095 sent in SET_3A_CONFIG (win_cmds bit 0x80; 300 = infinity, 4095 = macro); -1 = off");
++
+ void isp4if_send_3a_config(struct isp4_interface *ispif)
+ {
+ 	struct isp4if_exp_3a_config cfg = {
+@@ -1057,12 +1069,18 @@
+ 		cfg.flags |= EXP_3A_F_AF_MODE;
+ 		cfg.af_mode = af_mode;
+ 	}
++	/* patch 0039: manual focus overrides af_mode, in the form Windows uses */
++	if (lens_pos >= 0) {
++		cfg.flags |= EXP_3A_F_AF_MODE | EXP_3A_F_LENS_POS;
++		cfg.af_mode = 1;
++		cfg.lens_pos = min(lens_pos, 4095);
++	}
+ 
+ 	/* a previous stream start left its payload buffer; the firmware has read it by now */
+ 	if (exp_3a_mem)
+ 		isp4if_gpu_mem_free(ispif, &exp_3a_mem);
+-	dev_info(ispif->dev, "EXP-3A: SET_3A_CONFIG flags 0x%x, AE %u, flicker %u, AWB %u, AF %u\n",
+-		 cfg.flags, cfg.ae_mode, cfg.flicker, cfg.awb_mode, cfg.af_mode);
++	dev_info(ispif->dev, "EXP-3A: SET_3A_CONFIG flags 0x%x, AE %u, flicker %u, AWB %u, AF %u, lens %u\n",
++		 cfg.flags, cfg.ae_mode, cfg.flicker, cfg.awb_mode, cfg.af_mode, cfg.lens_pos);
+ 	isp4if_replay_one(ispif, EXP_CMD_ID_SET_3A_CONFIG, "SET_3A_CONFIG", &cfg, sizeof(cfg),
+ 			  &exp_3a_mem);
+ }

@@ -1,0 +1,113 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -4,8 +4,10 @@
+  */
+ 
+ #include <linux/iopoll.h>
++#include <linux/kernel_read_file.h>
+ #include <linux/moduleparam.h>
+ #include <linux/sizes.h>
++#include <linux/vmalloc.h>
+ 
+ #include "isp4_debug.h"
+ #include "isp4_fw_cmd_resp.h"
+@@ -15,6 +17,9 @@
+ #include "isp4_ov13b_script.h"
+ #include "isp4_ov13b_sensor_prop.h"
+ 
++/* EXPERIMENT (GZ302): firmware-visible copy of the tuning file, see isp4if_replay_tuning() */
++static struct isp4if_gpu_mem_info *exp_tuning_mem;
++
+ #define ISP4IF_FW_RESP_RB_IRQ_EN_MASK \
+ 	(ISP_SYS_INT0_EN__SYS_INT_RINGBUFFER_WPT9_EN_MASK\
+ 	 | ISP_SYS_INT0_EN__SYS_INT_RINGBUFFER_WPT12_EN_MASK)
+@@ -177,6 +182,8 @@
+ 		isp4if_gpu_mem_free(ispif, &ispif->exp_sensor_script);
+ 	if (ispif->exp_sensor_prop)
+ 		isp4if_gpu_mem_free(ispif, &ispif->exp_sensor_prop);
++	if (exp_tuning_mem)
++		isp4if_gpu_mem_free(ispif, &exp_tuning_mem);
+ 
+ 	for (unsigned int i = 0; i < ISP4IF_MAX_STREAM_BUF_COUNT; i++)
+ 		isp4if_gpu_mem_free(ispif, &ispif->meta_info_buf[i]);
+@@ -902,6 +909,72 @@
+ 		 ret ? "NO ANSWER / FAILED" : "answered", ret);
+ }
+ 
++/*
++ * SET_TUNING_DATA (0x02050008), decoded from amdcamera.sys (findings section 28).  The firmware
++ * log says "Host setfile buf queue empty" / "RTA setfile buf empty" and fails START_STREAM
++ * (error 0x27) because the host never delivers the sensor tuning file.  Windows copies the file
++ * (OV13B_3001_ROG_SRX.atb, 565520 bytes) to offset 0 of a firmware-visible buffer and sends a
++ * 12-word parameter block:
++ *     [0] 14 (buffer type, "type=14" in the firmware log)   [1] 0   [2] 4 (unknown, copied)
++ *     [3],[4] GPU address lo/hi   [5] size   [6]..[8] second blob (address lo/hi, size) = 0 here
++ * The file is read at run time from the path in tuning_file, so no Windows data is in the source.
++ * Off when tuning_file is empty.
++ */
++#define EXP_CMD_ID_SET_TUNING_DATA	0x02050008
++#define EXP_TUNING_BUF_TYPE		14
++#define EXP_TUNING_AREA			0x300000	/* Windows' buffer size for the first blob */
++
++static char *tuning_file;
++module_param(tuning_file, charp, 0444);
++MODULE_PARM_DESC(tuning_file,
++		 "EXPERIMENT: path of the sensor tuning file (OV13B_3001_ROG_SRX.atb) to send with SET_TUNING_DATA; needs replay_sensor_setup=1");
++
++static void isp4if_replay_tuning(struct isp4_interface *ispif)
++{
++	struct device *dev = ispif->dev;
++	struct isp4if_gpu_mem_info *mem;
++	u32 pkg[12] = { 0 };
++	size_t size = 0;
++	void *data = NULL;
++	ssize_t rd;
++	int ret;
++
++	if (!tuning_file || !*tuning_file)
++		return;
++
++	rd = kernel_read_file_from_path(tuning_file, 0, &data, EXP_TUNING_AREA, &size,
++					READING_FIRMWARE);
++	if (rd < 0) {
++		dev_err(dev, "EXP-REPLAY: SET_TUNING_DATA: cannot read %s: %zd\n", tuning_file, rd);
++		return;
++	}
++
++	/* A previous init of this module load may have left its buffer behind. */
++	if (exp_tuning_mem)
++		isp4if_gpu_mem_free(ispif, &exp_tuning_mem);
++
++	mem = isp4if_gpu_mem_alloc(ispif, EXP_TUNING_AREA);
++	if (!mem) {
++		dev_err(dev, "EXP-REPLAY: SET_TUNING_DATA: no GPU memory for %u bytes\n", EXP_TUNING_AREA);
++		vfree(data);
++		return;
++	}
++	exp_tuning_mem = mem;
++
++	memset(mem->sys_addr, 0, mem->mem_size);
++	memcpy(mem->sys_addr, data, size);
++	vfree(data);
++
++	pkg[0] = EXP_TUNING_BUF_TYPE;
++	pkg[2] = 4;
++	isp4if_split_addr64(mem->gpu_mc_addr, &pkg[3], &pkg[4]);
++	pkg[5] = size;
++
++	ret = isp4if_send_command_sync(ispif, EXP_CMD_ID_SET_TUNING_DATA, pkg, sizeof(pkg));
++	dev_info(dev, "EXP-REPLAY: SET_TUNING_DATA: %zu bytes from %s at GPU 0x%llx -> %s (%d)\n",
++		 size, tuning_file, mem->gpu_mc_addr, ret ? "NO ANSWER / FAILED" : "answered", ret);
++}
++
+ int isp4if_replay_sensor_setup(struct isp4_interface *ispif)
+ {
+ 	if (!replay_sensor_setup)
+@@ -912,6 +985,7 @@
+ 
+ 	isp4if_replay_one(ispif, EXP_CMD_ID_SET_DEVICE_SCRIPT, "SET_DEVICE_SCRIPT",
+ 			  isp4_ov13b_script, ISP4_OV13B_SCRIPT_SIZE, &ispif->exp_sensor_script);
++	isp4if_replay_tuning(ispif);	/* Windows order: script, (embedded prop skipped), tuning, sensor prop */
+ 	isp4if_replay_sensor_prop(ispif);
+ 	isp4if_replay_bogus_cmd(ispif);
+ 

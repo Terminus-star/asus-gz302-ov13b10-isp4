@@ -1,0 +1,108 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -382,6 +382,14 @@
+ 	if (package && package_size)
+ 		memcpy(cmd.cmd_param, package, package_size);
+ 
++	if (sync) {
++		/* EXPERIMENT: ring state just before a synchronous command (disable channel / stop) */
++		char tag[64];
++
++		snprintf(tag, sizeof(tag), "before %s", isp4dbg_get_cmd_str(cmd_id));
++		isp4if_dump_rings(ispif, tag);
++	}
++
+ 	scoped_guard(mutex, &ispif->isp4if_mutex) {
+ 		ret = read_poll_timeout(isp4if_is_cmdq_rb_full, ret, !ret,
+ 					ISP4IF_RB_FULL_SLEEP_US,
+@@ -434,6 +442,11 @@
+ 		ret = wait_for_completion_timeout(&ele->cmd_done,
+ 						  ISP4IF_FW_CMD_TIMEOUT);
+ 		if (!ret) {
++			/* EXPERIMENT: ring state when the firmware did not answer in time */
++			char tag[64];
++
++			snprintf(tag, sizeof(tag), "TIMEOUT %s", isp4dbg_get_cmd_str(cmd_id));
++			isp4if_dump_rings(ispif, tag);
+ 			ret = -ETIMEDOUT;
+ 			goto err_dequeue_ele;
+ 		}
+@@ -706,6 +719,48 @@
+ 	return -EINVAL;
+ }
+ 
++/*
++ * EXPERIMENT (GZ302 bring-up, not for upstream).
++ *
++ * Log the read/write pointers of the command and response rings plus the interrupt registers,
++ * so a silent firmware can be told apart from responses that were written but never read:
++ *   - cmd rd != cmd wr  : the firmware has not consumed every command the host queued.
++ *   - resp rd != resp wr: the firmware wrote responses the host has not consumed; the first
++ *                         unread one is decoded here without moving the read pointer.
++ * Pointers are byte offsets into the ring. The union fields are printed raw: they only mean
++ * something when resp_id is ISP4FW_RESP_ID_CMD_DONE.
++ */
++void isp4if_dump_rings(struct isp4_interface *ispif, const char *when)
++{
++	struct device *dev = ispif->dev;
++
++	dev_info(dev, "EXP-RING[%s]: INT0_EN 0x%08x INT0_STATUS 0x%08x ISP_STATUS 0x%08x\n",
++		 when, isp4hw_rreg(ispif->mmio, ISP_SYS_INT0_EN),
++		 isp4hw_rreg(ispif->mmio, ISP_SYS_INT0_STATUS),
++		 isp4hw_rreg(ispif->mmio, ISP_STATUS));
++
++	for (int s = ISP4IF_STREAM_ID_GLOBAL; s <= ISP4IF_STREAM_ID_1; s++) {
++		const struct isp4if_rb_config *c = &isp4if_cmd_rb_config[s];
++		const struct isp4if_rb_config *r = &isp4if_resp_rb_config[s];
++		u32 c_rd = isp4hw_rreg(ispif->mmio, c->reg_rptr);
++		u32 c_wr = isp4hw_rreg(ispif->mmio, c->reg_wptr);
++		u32 r_rd = isp4hw_rreg(ispif->mmio, r->reg_rptr);
++		u32 r_wr = isp4hw_rreg(ispif->mmio, r->reg_wptr);
++
++		dev_info(dev, "EXP-RING[%s]: %s rd %u wr %u | %s rd %u wr %u | ring size %u\n",
++			 when, c->name, c_rd, c_wr, r->name, r_rd, r_wr, r->val_size);
++
++		if (r_rd != r_wr && r->base_sys_addr && r_rd < r->val_size &&
++		    r->val_size - r_rd >= sizeof(struct isp4fw_resp)) {
++			const struct isp4fw_resp *p = r->base_sys_addr + r_rd;
++
++			dev_info(dev, "EXP-RING[%s]:   unread on %s: seq %u resp_id 0x%x cmd_id 0x%x cmd_status %u\n",
++				 when, r->name, p->resp_seq_num, p->resp_id,
++				 p->param.cmd_done.cmd_id, p->param.cmd_done.cmd_status);
++		}
++	}
++}
++
+ int isp4if_send_command(struct isp4_interface *ispif, u32 cmd_id,
+ 			const void *package, u32 package_size)
+ {
+--- a/drivers/media/platform/amd/isp4/isp4_interface.h
++++ b/drivers/media/platform/amd/isp4/isp4_interface.h
+@@ -109,6 +109,9 @@
+ int isp4if_f2h_resp(struct isp4_interface *ispif, enum isp4if_stream_id stream,
+ 		    struct isp4fw_resp *resp);
+ 
++/* EXPERIMENT (GZ302 bring-up): log ring-buffer and interrupt state, see isp4_interface.c */
++void isp4if_dump_rings(struct isp4_interface *ispif, const char *when);
++
+ int isp4if_send_command(struct isp4_interface *ispif, u32 cmd_id,
+ 			const void *package, u32 package_size);
+ 
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -233,6 +233,7 @@
+ 
+ 		dev_info(dev, "EXP: START_STREAM queued to fw (kickoff), buf_sent %u, min %u\n",
+ 			 sensor_info->buf_sent_cnt, min_start_bufs);
++		isp4if_dump_rings(ispif, "after START_STREAM queued (kickoff)");
+ 		sensor_info->start_stream_cmd_sent = true;
+ 	} else {
+ 		dev_dbg(dev,
+@@ -883,6 +884,7 @@
+ 			dev_info(dev, "EXP: START_STREAM queued to fw (img buf), buf_sent %u, min %u\n",
+ 				 isp_subdev->sensor_info.buf_sent_cnt,
+ 				 min_start_bufs);
++			isp4if_dump_rings(ispif, "after START_STREAM queued (img buf)");
+ 			isp_subdev->sensor_info.start_stream_cmd_sent = true;
+ 			isp_subdev->sensor_info.output_info.start_status =
+ 				ISP4SD_START_STATUS_STARTED;

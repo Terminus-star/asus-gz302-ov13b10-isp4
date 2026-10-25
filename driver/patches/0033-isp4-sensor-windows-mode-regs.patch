@@ -1,0 +1,58 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -76,11 +76,14 @@
+  *   sensor_pll=1  read the live PLL/MIPI registers back over raw I2C and log them (no writes)
+  *   sensor_pll=2  read back, then in software standby (0x0100=0) write the Windows PLL values, stream on again
+  *                 (0x0100=1), and read back again
++ *   sensor_pll=3  (patch 0033) as 2, plus the other mode registers where the Windows table differs from the
++ *                 Linux ov13b10 one (findings section 59): above all 0x3813=0x08 (vertical window offset; Linux
++ *                 0x09 shifts the Bayer pattern by one row, suspected cause of the magenta cast, section 88)
+  */
+ static unsigned int sensor_pll;
+ module_param(sensor_pll, uint, 0444);
+ MODULE_PARM_DESC(sensor_pll,
+-		 "EXPERIMENT: after ov13b10 s_stream: 1 log the PLL registers, 2 also apply the Windows (24 MHz) PLL values");
++		 "EXPERIMENT: after ov13b10 s_stream: 1 log the PLL registers, 2 also apply the Windows (24 MHz) PLL values, 3 also the other Windows mode registers (0x3813=08 ...)");
+ 
+ /*
+  * EXPERIMENT (GZ302, patch 0028): firmware commands that the Windows driver sends for a working preview and the
+@@ -200,6 +203,7 @@
+ /* PLL, stream and MIPI timing registers that differ or matter between the Windows and Linux tables */
+ static const u16 exp_pll_regs[] = {
+ 	0x0100, 0x0303, 0x0305, 0x0321, 0x0323, 0x0324, 0x0325, 0x0326, 0x0327, 0x3011, 0x4800, 0x4837,
++	0x3600, 0x380f, 0x3813, 0x3774, 0x3823, 0x3827,	/* patch 0033: mode registers of sensor_pll=3 */
+ };
+ 
+ static void isp4sd_exp_pll_dump(struct device *dev, struct i2c_client *client, const char *when)
+@@ -242,6 +246,31 @@
+ 		if (i == 0)
+ 			usleep_range(5000, 6000);	/* let the current frame end before touching the PLL */
+ 	}
++	if (sensor_pll >= 3) {
++		/*
++		 * patch 0033: Windows mode values that differ from the Linux table (section 59), still in standby.
++		 * Exposure/gain registers (0x3501/0x3502/0x3508/0x3509) are left out: the firmware's AE writes them.
++		 */
++		static const struct { u16 reg; u8 val; } mode[] = {
++			{ 0x3813, 0x08 },	/* vertical window offset (Linux 0x09): Bayer phase */
++			{ 0x3600, 0x1a },	/* analog (Linux 0x16) */
++			{ 0x380f, 0x94 },	/* frame length low byte, 0x0c94 = 3220 lines (Linux 0x7c) */
++			{ 0x3011, 0x7c },	/* only in the Windows table */
++			{ 0x3774, 0x2d },	/* only in the Windows table */
++			{ 0x3823, 0x18 },	/* only in the Windows table */
++			{ 0x3827, 0x01 },	/* only in the Windows table */
++		};
++
++		for (unsigned int i = 0; i < ARRAY_SIZE(mode); i++) {
++			ret = isp4sd_exp_wr8(client, mode[i].reg, mode[i].val);
++			if (ret) {
++				dev_err(dev, "EXP-SENSOR: mode write 0x%04x=0x%02x failed: %d\n",
++					mode[i].reg, mode[i].val, ret);
++				return ret;
++			}
++		}
++		dev_info(dev, "EXP-SENSOR: applied the Windows mode registers (0x3813=08 0x3600=1a 0x380f=94 0x3011=7c 0x3774=2d 0x3823=18 0x3827=01)\n");
++	}
+ 	usleep_range(5000, 6000);		/* PLL lock */
+ 	ret = isp4sd_exp_wr8(client, 0x0100, 0x01);	/* stream on */
+ 	dev_info(dev, "EXP-SENSOR: applied the Windows PLL values (0x0303=01 0x0305=46 0x0325=55), stream on -> %d\n", ret);

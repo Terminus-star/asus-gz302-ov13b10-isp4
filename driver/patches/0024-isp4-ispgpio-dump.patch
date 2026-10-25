@@ -1,0 +1,62 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -763,6 +763,22 @@
+  * Pointers are byte offsets into the ring. The union fields are printed raw: they only mean
+  * something when resp_id is ISP4FW_RESP_ID_CMD_DONE.
+  */
++/*
++ * EXPERIMENT (GZ302, patch 0024): the ISP's own pin controller (drivers/pinctrl/pinctrl-amdisp.c) has three
++ * output-only pins, GPIO_0/1/2 = "sensor0/1/2 control", at ISP offsets 0x6613c, 0x66140 and 0x6618c; the output
++ * value is bit 4.  Linux only drives sensor0.  They are printed in every EXP-RING snapshot, to see which one is
++ * high while the front-camera LED is lit (findings section 53).  The window lies outside ispif->mmio (which ends at
++ * 0x629a4), so it is mapped once in isp4if_init() (process context) with a plain devm_ioremap().
++ */
++#define EXP_ISPGPIO_BASE	0x6613c
++#define EXP_ISPGPIO_SIZE	0x54
++#define EXP_ISPGPIO_0		0x00
++#define EXP_ISPGPIO_1		0x04
++#define EXP_ISPGPIO_2		0x50
++#define EXP_ISPGPIO_OUT_BIT	4
++
++static void __iomem *exp_ispgpio;
++
+ void isp4if_dump_rings(struct isp4_interface *ispif, const char *when)
+ {
+ 	struct device *dev = ispif->dev;
+@@ -775,6 +791,16 @@
+ 		 isp4hw_rreg(ispif->mmio, ISP_SYS_INT0_STATUS),
+ 		 isp4hw_rreg(ispif->mmio, ISP_STATUS));
+ 
++	if (exp_ispgpio) {
++		u32 g0 = readl(exp_ispgpio + EXP_ISPGPIO_0);
++		u32 g1 = readl(exp_ispgpio + EXP_ISPGPIO_1);
++		u32 g2 = readl(exp_ispgpio + EXP_ISPGPIO_2);
++
++		dev_info(dev, "EXP-RING[%s]: ISP sensor-control pins gpio0 0x%08x gpio1 0x%08x gpio2 0x%08x (output bit 4: %u %u %u)\n",
++			 when, g0, g1, g2, (g0 >> EXP_ISPGPIO_OUT_BIT) & 1,
++			 (g1 >> EXP_ISPGPIO_OUT_BIT) & 1, (g2 >> EXP_ISPGPIO_OUT_BIT) & 1);
++	}
++
+ 	for (int s = ISP4IF_STREAM_ID_GLOBAL; s <= ISP4IF_STREAM_ID_1; s++) {
+ 		const struct isp4if_rb_config *c = &isp4if_cmd_rb_config[s];
+ 		const struct isp4if_rb_config *r = &isp4if_resp_rb_config[s];
+@@ -1316,9 +1342,19 @@
+ int isp4if_init(struct isp4_interface *ispif, struct device *dev,
+ 		void __iomem *isp_mmio)
+ {
++	struct resource *res;
++
+ 	ispif->dev = dev;
+ 	ispif->mmio = isp_mmio;
+ 
++	/* patch 0024: map the ISP sensor-control pin registers for the EXP-RING snapshots (see above) */
++	exp_ispgpio = NULL;
++	res = platform_get_resource(to_platform_device(dev), IORESOURCE_MEM, 0);
++	if (res)
++		exp_ispgpio = devm_ioremap(dev, res->start + EXP_ISPGPIO_BASE, EXP_ISPGPIO_SIZE);
++	if (!exp_ispgpio)
++		dev_warn(dev, "EXP: ISP sensor-control pin registers not mapped, they will not be logged\n");
++
+ 	spin_lock_init(&ispif->cmdq_lock); /* used for cmdq access */
+ 	spin_lock_init(&ispif->bufq_lock); /* used for bufq access */
+ 	mutex_init(&ispif->isp4if_mutex); /* used for commands sent to ispfw */

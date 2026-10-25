@@ -1,0 +1,132 @@
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -77,6 +77,8 @@
+ static struct isp4if_gpu_mem_info *exp_log_mem;
+ /* EXPERIMENT (GZ302, patch 0045): data buffer of SEND_I2C_MSG, see isp4if_fw_i2c_write() */
+ static struct isp4if_gpu_mem_info *exp_i2c_mem;
++/* EXPERIMENT (GZ302, patch 0048): SET_M2M_CAL_DATA payload, see isp4if_send_m2m_cal() */
++static struct isp4if_gpu_mem_info *exp_m2m_mem;
+ 
+ /*
+  * EXPERIMENT (GZ302): size of the firmware memory pool in MiB.  The stock driver sends 100 MiB
+@@ -274,6 +276,8 @@
+ 		isp4if_gpu_mem_free(ispif, &exp_log_mem);
+ 	if (exp_i2c_mem)	/* patch 0045 */
+ 		isp4if_gpu_mem_free(ispif, &exp_i2c_mem);
++	if (exp_m2m_mem)	/* patch 0048 */
++		isp4if_gpu_mem_free(ispif, &exp_m2m_mem);
+ 
+ 	for (unsigned int i = 0; i < ISP4IF_MAX_STREAM_BUF_COUNT; i++)
+ 		isp4if_gpu_mem_free(ispif, &ispif->meta_info_buf[i]);
+@@ -1146,6 +1150,21 @@
+ }
+ 
+ /*
++ * EXPERIMENT (GZ302, patch 0048): SET_M2M_CAL_DATA (0x02090005, stream, {GPU addr lo, hi, size, checksum},
++ * sync), the module calibration Windows sends between SET_STREAM_CONFIG and APPLY_TUNING_SCENARIO
++ * (findings 121). The payload (0x2180 bytes) is built by isp4_subdev.c from the module EEPROM.
++ */
++#define EXP_CMD_ID_SET_M2M_CAL_DATA	0x02090005
++
++void isp4if_send_m2m_cal(struct isp4_interface *ispif, const void *buf, u32 len)
++{
++	/* a previous stream start left its payload buffer; the firmware has read it by now */
++	if (exp_m2m_mem)
++		isp4if_gpu_mem_free(ispif, &exp_m2m_mem);
++	isp4if_replay_one(ispif, EXP_CMD_ID_SET_M2M_CAL_DATA, "SET_M2M_CAL_DATA", buf, len, &exp_m2m_mem);
++}
++
++/*
+  * EXPERIMENT (GZ302, patch 0044): SET_LOG_MODULE_LEVEL (0x01020009, GLOBAL, indirect), to make the
+  * firmware log what happens to the lens moves (findings 111, 113). Payload (116 bytes, checked against
+  * the checksum 0x77577775 in Windows' trace): 112 bytes of 4-bit levels, the level of firmware module
+--- a/drivers/media/platform/amd/isp4/isp4_interface.h
++++ b/drivers/media/platform/amd/isp4/isp4_interface.h
+@@ -133,6 +133,9 @@
+ /* EXPERIMENT (GZ302, patch 0045): 8-bit-register I2C write performed by the firmware (SEND_I2C_MSG) */
+ int isp4if_fw_i2c_write(struct isp4_interface *ispif, u8 slave, u8 reg, u8 val);
+ 
++/* EXPERIMENT (GZ302, patch 0048): module calibration (SET_M2M_CAL_DATA), payload built by isp4_subdev.c */
++void isp4if_send_m2m_cal(struct isp4_interface *ispif, const void *buf, u32 len);
++
+ int isp4if_send_command(struct isp4_interface *ispif, u32 cmd_id,
+ 			const void *package, u32 package_size);
+ 
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -1139,6 +1139,64 @@
+ 	put_device(sdev);
+ }
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0048): module calibration, step 2: send it. The 0x2180-byte SET_M2M_CAL_DATA
++ * payload is built from the EEPROM as Windows' isp_set_m2m_calib_2_fw (amdcamera.sys 0x140018fbc) does
++ * (findings 121; checked offline: same checksum as Windows on this laptop, 0x6994265e):
++ *   +0x00 sensor id (0); +0x04 EEPROM 0x00..0x8e; +0x94 EEPROM 0x8e..0x98 (2-byte gap at +0x92);
++ *   +0xa0 lens shading: packed (flag +0x22 = 1): 0x672 x 3 bytes -> two signed 12-bit values each, stored
++ *   as s16 (isp_convert_lsc_to_unpacked), then CRC-32 of +0x84..+0x1a68 at +0x1a68; unpacked: 0x19cc bytes
++ *   copied; +0x1a6c AWB calibration (0x2c, flag +0x23); +0x1a98 AF calibration (0x6e6, flag +0x24).
++ * m2m_send=1 (default 0) sends it after the read (needs m2m_read >= 1), before APPLY_TUNING_SCENARIO.
++ */
++#define EXP_M2M_FW_SIZE		0x2180
++
++static bool m2m_send;
++module_param(m2m_send, bool, 0444);
++MODULE_PARM_DESC(m2m_send,
++		 "EXPERIMENT: send the module calibration to the firmware (SET_M2M_CAL_DATA) like Windows; needs m2m_read >= 1 (default off)");
++
++static u8 exp_m2m_fw[EXP_M2M_FW_SIZE];
++
++static void isp4sd_exp_m2m_build(const u8 *cal, u8 *out)
++{
++	bool packed = cal[0x22] == 1;
++	const u8 *p = cal + 0x98;
++	unsigned int i;
++
++	memset(out, 0, EXP_M2M_FW_SIZE);
++	put_unaligned_le32(0, out);			/* sensor id: 0 for sensor 0 */
++	memcpy(out + 0x04, cal, 0x8e);
++	memcpy(out + 0x94, cal + 0x8e, 0x0a);
++	if (packed) {
++		for (i = 0; i < 0x672; i++, p += 3) {
++			put_unaligned_le16(sign_extend32((p[0] << 4) | (p[1] >> 4), 11), out + 0xa0 + 4 * i);
++			put_unaligned_le16(sign_extend32(((p[1] & 0xf) << 8) | p[2], 11), out + 0xa2 + 4 * i);
++		}
++		put_unaligned_le32(isp4sd_exp_m2m_crc(out + 0x84, 0x19e4), out + 0x1a68);
++	} else {
++		memcpy(out + 0xa0, p, 0x19cc);
++	}
++	if (cal[0x23] == 1)
++		memcpy(out + 0x1a6c, cal + (packed ? 0x13f4 : 0x1a64), 0x2c);
++	if (cal[0x24] == 1)
++		memcpy(out + 0x1a98, cal + (packed ? 0x1420 : 0x1a90), 0x6e6);
++}
++
++static void isp4sd_exp_m2m_send(struct isp4_subdev *isp_subdev)
++{
++	if (!m2m_send)
++		return;
++	if (!exp_m2m_done) {
++		dev_warn(isp_subdev->dev, "EXP-M2M: m2m_send needs a good read (m2m_read=1); not sent\n");
++		return;
++	}
++	isp4sd_exp_m2m_build(exp_m2m_buf, exp_m2m_fw);
++	dev_info(isp_subdev->dev, "EXP-M2M: SET_M2M_CAL_DATA payload built, flags %02x %02x %02x (expect checksum 0x6994265e on the tested GZ302)\n",
++		 exp_m2m_buf[0x22], exp_m2m_buf[0x23], exp_m2m_buf[0x24]);
++	isp4if_send_m2m_cal(&isp_subdev->ispif, exp_m2m_fw, EXP_M2M_FW_SIZE);
++}
++
+ static int isp4sd_init_stream(struct isp4_subdev *isp_subdev)
+ {
+ 	struct device *dev = isp_subdev->dev;
+@@ -1167,8 +1225,9 @@
+ 		return ret;
+ 	}
+ 
+-	/* EXPERIMENT (patch 0047): Windows sends SET_M2M_CAL_DATA here; step 1 only reads the data */
++	/* EXPERIMENT (patch 0047, 0048): Windows sends SET_M2M_CAL_DATA here: read the EEPROM, then send it */
+ 	isp4sd_exp_m2m_read(dev);
++	isp4sd_exp_m2m_send(isp_subdev);
+ 
+ 	/* EXPERIMENT (patch 0028): Windows then selects the tuning scenario (0 = preview) */
+ 	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_TUNING_SCENARIO, EXP_CMD_ID_APPLY_TUNING_SCENARIO,

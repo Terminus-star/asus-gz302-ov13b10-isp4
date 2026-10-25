@@ -1,0 +1,28 @@
+--- a/drivers/media/platform/amd/isp4/isp4_video.c
++++ b/drivers/media/platform/amd/isp4/isp4_video.c
+@@ -532,7 +532,7 @@
+ 					unsigned int count)
+ {
+ 	struct isp4vid_dev *isp_vdev = vb2_get_drv_priv(vq);
+-	struct isp4vid_capture_buffer *isp4vid_buf;
++	struct isp4vid_capture_buffer *isp4vid_buf, *next_buf;
+ 	struct media_entity *entity;
+ 	struct v4l2_subdev *subdev;
+ 	struct media_pad *pad;
+@@ -567,7 +567,15 @@
+ 		}
+ 	}
+ 
+-	list_for_each_entry(isp4vid_buf, &isp_vdev->buf_list, list)
++	/*
++	 * EXPERIMENT (GZ302, patch 0031): the firmware can complete a buffer, and the frame-done path can
++	 * list_del() it from buf_list (under buf_list_lock), while this loop is still inside
++	 * isp4sd_ioc_send_img_buf() for that buffer (START_STREAM and the experimental sensor start run in
++	 * there).  The plain iterator then followed the poisoned ->next and oopsed (findings section 83).
++	 * The _safe iterator reads the next entry before sending the current one; an entry that has not
++	 * been sent yet cannot be completed by the firmware, so it cannot be removed meanwhile.
++	 */
++	list_for_each_entry_safe(isp4vid_buf, next_buf, &isp_vdev->buf_list, list)
+ 		isp4sd_ioc_send_img_buf(isp_vdev->isp_sdev,
+ 					&isp4vid_buf->img_buf);
+ 

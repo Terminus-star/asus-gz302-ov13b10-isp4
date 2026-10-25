@@ -1,0 +1,71 @@
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -727,6 +727,42 @@
+ 
+ static DECLARE_WORK(exp_af_work, isp4sd_exp_af_work_fn);
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0051): the AF target is on the firmware's algorithm scale (0..4095); patch 0050's /4
++ * overdrove the lens (findings 128). Algorithm -> Real: piecewise-linear through the six pairs the AF library
++ * prints for this module (findings 128). Real -> motor code: a line through two MEASURED anchors from the lens
++ * sweeps (findings 130): Real 940 (infinity) -> af_inf_code, Real 2220 (macro) -> af_macro_code; the firmware's
++ * own Real/4 is about 2x too steep toward macro. The code is clamped to [af_inf_code - 50, af_macro_code + 60].
++ */
++static int af_inf_code = 248;
++module_param(af_inf_code, int, 0444);
++MODULE_PARM_DESC(af_inf_code, "EXPERIMENT: motor code for infinity focus (firmware Real 940), measured 248");
++
++static int af_macro_code = 407;
++module_param(af_macro_code, int, 0444);
++MODULE_PARM_DESC(af_macro_code, "EXPERIMENT: motor code for macro focus (firmware Real 2220), from the measured slope 407");
++
++static const u16 exp_af_alg[] = { 0, 755, 1063, 3668, 3805, 4095 };
++static const u16 exp_af_real[] = { 700, 860, 940, 2220, 2348, 2620 };
++
++static int isp4sd_exp_af_alg_to_real(u32 alg)
++{
++	unsigned int i = 1;
++
++	alg = min(alg, 4095U);
++	while (i < ARRAY_SIZE(exp_af_alg) - 1 && alg > exp_af_alg[i])
++		i++;
++	return exp_af_real[i - 1] + (int)(alg - exp_af_alg[i - 1]) * (exp_af_real[i] - exp_af_real[i - 1]) /
++	       (exp_af_alg[i] - exp_af_alg[i - 1]);
++}
++
++static int isp4sd_exp_af_real_to_code(int real)
++{
++	int code = af_inf_code + (real - 940) * (af_macro_code - af_inf_code) / (2220 - 940);
++
++	return clamp(code, max(af_inf_code - 50, 0), min(af_macro_code + 60, ISP4SD_FOCUS_MAX));
++}
++
+ static void isp4sd_exp_af_cancel(void)
+ {
+ 	cancel_work_sync(&exp_af_work);
+@@ -737,18 +773,21 @@
+ {
+ 	unsigned int idx;
+ 	const u8 *d;
+-	int pos;
++	int real, pos;
++	u32 alg;
+ 
+ 	if (!af_drive || !get_unaligned_le32((const u8 *)meta_info + 0x108 * 4))
+ 		return;
+ 	d = isp4sd_exp_3a_buf(meta_info, &idx);
+ 	if (!d)
+ 		return;
+-	pos = min(get_unaligned_le32(d + 0x110) / 4, (u32)ISP4SD_FOCUS_MAX);
++	alg = get_unaligned_le32(d + 0x110);
++	real = isp4sd_exp_af_alg_to_real(alg);		/* patch 0051 */
++	pos = isp4sd_exp_af_real_to_code(real);
+ 	if (pos == exp_af_last)
+ 		return;
+-	dev_info(dev, "EXP-AF: poc %u: AF state %u, target %u -> motor %d\n",
+-		 get_unaligned_le32(meta_info), get_unaligned_le32(d + 0x88), get_unaligned_le32(d + 0x110), pos);
++	dev_info(dev, "EXP-AF: poc %u: AF state %u, target %u -> real %d -> motor %d\n",
++		 get_unaligned_le32(meta_info), get_unaligned_le32(d + 0x88), alg, real, pos);
+ 	exp_af_last = pos;
+ 	xchg(&exp_af_pending, pos);
+ 	schedule_work(&exp_af_work);
